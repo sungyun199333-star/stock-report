@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -79,14 +80,19 @@ def get_prices(ticker):
         raise RuntimeError("주가 데이터가 없습니다.")
     result = results[0]
     quote = result.get("indicators", {}).get("quote", [{}])[0]
+    opens = quote.get("open") or []
     highs = quote.get("high") or []
     lows = quote.get("low") or []
     rows = [
-        (float(close), int(volume or 0), float(high), float(low))
-        for close, volume, high, low in zip(
-            quote.get("close") or [], quote.get("volume") or [], highs, lows
+        (
+            float(close), int(volume or 0), float(high), float(low), float(open_price),
+            datetime.fromtimestamp(timestamp, timezone.utc).astimezone(SEOUL),
         )
-        if close is not None and high is not None and low is not None
+        for timestamp, close, open_price, volume, high, low in zip(
+            result.get("timestamp") or [], quote.get("close") or [], opens,
+            quote.get("volume") or [], highs, lows
+        )
+        if close is not None and open_price is not None and high is not None and low is not None
     ]
     if len(rows) < 78:
         raise RuntimeError(
@@ -294,11 +300,149 @@ def get_news(ticker):
     ]
 
 
-def make_report():
+def create_chart(ticker, stock, rows, currency, output_dir):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from matplotlib.ticker import FuncFormatter
+
+    closes = [row[0] for row in rows]
+    volumes = [row[1] for row in rows]
+    highs = [row[2] for row in rows]
+    lows = [row[3] for row in rows]
+    opens = [row[4] for row in rows]
+    dates = [row[5] for row in rows]
+    count = len(rows)
+    x_values = list(range(count))
+    averages = {
+        period: [
+            sum(closes[index - period + 1:index + 1]) / period
+            if index + 1 >= period else None
+            for index in range(count)
+        ]
+        for period in (5, 20, 50, 120, 200)
+    }
+    upper_band = []
+    lower_band = []
+    for index in range(count):
+        if index < 19:
+            upper_band.append(None)
+            lower_band.append(None)
+            continue
+        window = closes[index - 19:index + 1]
+        mean = sum(window) / 20
+        deviation = (sum((value - mean) ** 2 for value in window) / 20) ** 0.5
+        upper_band.append(mean + 2 * deviation)
+        lower_band.append(mean - 2 * deviation)
+
+    tenkan = [midpoint(highs, lows, 9, i) for i in range(count)]
+    kijun = [midpoint(highs, lows, 26, i) for i in range(count)]
+    span_a_raw = [
+        (tenkan[i] + kijun[i]) / 2 if tenkan[i] is not None and kijun[i] is not None else None
+        for i in range(count)
+    ]
+    span_b_raw = [midpoint(highs, lows, 52, i) for i in range(count)]
+    span_a = [span_a_raw[i - 26] if i >= 26 else None for i in range(count)]
+    span_b = [span_b_raw[i - 26] if i >= 26 else None for i in range(count)]
+
+    start = max(0, count - 130)
+    visible_x = x_values[start:]
+    fig, (price_ax, volume_ax) = plt.subplots(
+        2, 1, figsize=(12, 8), sharex=True,
+        gridspec_kw={"height_ratios": [3.2, 1]}, constrained_layout=True,
+    )
+    fig.suptitle(
+        f"{ticker} - Daily Candles and Indicators | {dates[-1]:%Y-%m-%d}",
+        fontsize=15, fontweight="bold",
+    )
+    for index in visible_x:
+        is_up = closes[index] >= opens[index]
+        color = "#159a69" if is_up else "#df4b52"
+        price_ax.vlines(index, lows[index], highs[index], color=color, linewidth=1)
+        bottom = min(opens[index], closes[index])
+        height = max(abs(closes[index] - opens[index]), closes[index] * 0.0003)
+        price_ax.add_patch(
+            Rectangle((index - 0.3, bottom), 0.6, height, facecolor=color,
+                      edgecolor=color, linewidth=0.7)
+        )
+        volume_ax.bar(index, volumes[index], color=color, width=0.65, alpha=0.75)
+
+    ma_colors = {5: "#1f77b4", 20: "#ff9f1c", 50: "#8a5bb7",
+                 120: "#555555", 200: "#a15c38"}
+    for period, values in averages.items():
+        price_ax.plot(
+            x_values[start:], values[start:], color=ma_colors[period],
+            linewidth=1.2, label=f"SMA {period}",
+        )
+    price_ax.plot(x_values[start:], upper_band[start:], color="#9878c7",
+                  linewidth=0.8, linestyle="--", label="Bollinger (20, 2σ)")
+    price_ax.plot(x_values[start:], lower_band[start:], color="#9878c7",
+                  linewidth=0.8, linestyle="--")
+    price_ax.fill_between(
+        x_values[start:],
+        [value if value is not None else float("nan") for value in lower_band[start:]],
+        [value if value is not None else float("nan") for value in upper_band[start:]],
+        color="#9878c7", alpha=0.08,
+    )
+    cloud_top = [
+        max(a, b) if a is not None and b is not None else None
+        for a, b in zip(span_a, span_b)
+    ]
+    cloud_bottom = [
+        min(a, b) if a is not None and b is not None else None
+        for a, b in zip(span_a, span_b)
+    ]
+    cloud_valid = [
+        a is not None and b is not None
+        for a, b in zip(cloud_bottom[start:], cloud_top[start:])
+    ]
+    price_ax.fill_between(
+        x_values[start:],
+        [value if value is not None else float("nan") for value in cloud_bottom[start:]],
+        [value if value is not None else float("nan") for value in cloud_top[start:]],
+        where=[valid and span_a[i] >= span_b[i] for i, valid in zip(visible_x, cloud_valid)],
+        color="#52a879", alpha=0.18, label="Ichimoku cloud (bullish)",
+    )
+    price_ax.fill_between(
+        x_values[start:],
+        [value if value is not None else float("nan") for value in cloud_bottom[start:]],
+        [value if value is not None else float("nan") for value in cloud_top[start:]],
+        where=[valid and span_a[i] < span_b[i] for i, valid in zip(visible_x, cloud_valid)],
+        color="#d76b72", alpha=0.16, label="Ichimoku cloud (bearish)",
+    )
+    price_ax.set_ylabel(f"Price ({currency})")
+    volume_ax.set_ylabel("Volume")
+    volume_ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f}M")
+    )
+    volume_ax.set_xlabel("Date")
+    price_ax.grid(True, alpha=0.2)
+    volume_ax.grid(True, axis="y", alpha=0.2)
+    price_ax.legend(loc="upper left", ncol=3, fontsize=8, framealpha=0.9)
+    tick_positions = list(range(start, count, max(1, (count - start) // 6)))
+    price_ax.set_xlim(start - 1, count)
+    volume_ax.set_xticks(tick_positions)
+    volume_ax.set_xticklabels(
+        [dates[index].strftime("%b %d") for index in tick_positions],
+        rotation=0,
+    )
+    chart_path = os.path.join(output_dir, f"{ticker.replace('.', '-')}.png")
+    fig.savefig(chart_path, dpi=150, facecolor="white")
+    plt.close(fig)
+    return chart_path
+
+
+def make_report(chart_dir):
     now = datetime.now(SEOUL).strftime("%Y-%m-%d %H:%M")
     lines = [f"📊 보유 종목 일일 리포트 ({now} KST)"]
+    charts = []
     for ticker, stock in STOCKS.items():
         rows, currency = get_prices(ticker)
+        charts.append(
+            (ticker, stock["name"], create_chart(ticker, stock, rows, currency, chart_dir))
+        )
         lines.extend(["", f"━━ {stock['name']} ({ticker}) ━━", "[기술적 분석]",
                       analyze(rows, currency), "[최근 24시간 뉴스]"])
         try:
@@ -324,7 +468,7 @@ def make_report():
         "뉴스: Google News RSS | 번역: Google Translate | 시세: Yahoo Finance",
         "※ 번역은 자동 처리되어 오역이 있을 수 있습니다. 원문은 링크에서 확인하세요.",
     ])
-    return "\n".join(lines)
+    return "\n".join(lines), charts
 
 
 def telegram_html(message):
@@ -384,19 +528,81 @@ def send_telegram(message):
             raise RuntimeError(f"텔레그램 API 오류: {result}")
 
 
+def send_chart(ticker, name, image_path):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID 환경 변수가 필요합니다.")
+    boundary = "----StockReportBoundary7MA4YWxkTrZu0gW"
+    fields = {
+        "chat_id": chat_id,
+        "caption": f"{name} ({ticker}) 일봉 차트 | 캔들·이평선·볼린저 밴드·일목 구름대",
+    }
+    body = bytearray()
+    for key, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+        )
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(
+        f'Content-Disposition: form-data; name="photo"; filename="{os.path.basename(image_path)}"\r\n'.encode()
+    )
+    body.extend(b"Content-Type: image/png\r\n\r\n")
+    with open(image_path, "rb") as image_file:
+        body.extend(image_file.read())
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            details = json.loads(exc.read()).get("description", str(exc))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            details = str(exc)
+        raise RuntimeError(
+            f"텔레그램 차트 전송 실패 (HTTP {exc.code}): {details}"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"텔레그램 차트 전송 실패: {exc}") from exc
+    if not result.get("ok"):
+        raise RuntimeError(f"텔레그램 차트 API 오류: {result}")
+
+
 def main():
     try:
-        report = make_report()
         if "--dry-run" in sys.argv[1:]:
-            print(
-                re.sub(
-                    r"\[\[ARTICLE_LINK:(https?://[^\]\s]+)\]\]",
-                    r"🔗 기사 원문: \1",
-                    report,
+            chart_dir = os.path.join(os.getcwd(), "stock_chart_preview")
+            os.makedirs(chart_dir, exist_ok=True)
+            temporary_charts = None
+        else:
+            temporary_charts = tempfile.TemporaryDirectory(prefix="stock-report-charts-")
+            chart_dir = temporary_charts.name
+        try:
+            report, charts = make_report(chart_dir)
+            if "--dry-run" in sys.argv[1:]:
+                print(
+                    re.sub(
+                        r"\[\[ARTICLE_LINK:(https?://[^\]\s]+)\]\]",
+                        r"🔗 기사 원문: \1",
+                        report,
+                    )
                 )
-            )
-            return 0
-        send_telegram(report)
+                for ticker, _name, chart_path in charts:
+                    print(f"{ticker} 차트 미리보기 파일: {chart_path}")
+                return 0
+            send_telegram(report)
+            for ticker, name, chart_path in charts:
+                send_chart(ticker, name, chart_path)
+        finally:
+            if temporary_charts is not None:
+                temporary_charts.cleanup()
     except (RuntimeError, ValueError, ET.ParseError, json.JSONDecodeError) as exc:
         print(f"리포트 실패: {exc}", file=sys.stderr)
         return 1
