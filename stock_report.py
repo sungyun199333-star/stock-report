@@ -2,6 +2,8 @@
 """Send daily stock news and technical-indicator reports to Telegram."""
 
 import html
+import csv
+import io
 import json
 import os
 import re
@@ -11,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
@@ -21,6 +24,15 @@ STOCKS = {
     "TSLA": {"name": "Tesla", "query": "Tesla OR TSLA"},
     "SPCX": {"name": "SPAC and New Issue ETF", "query": '"SPAC and New Issue ETF" OR SPCX'},
     "META": {"name": "Meta Platforms", "query": "Meta Platforms OR META"},
+}
+MACRO_SERIES = {
+    "DGS10": "미 10년물 금리",
+    "DEXKOUS": "USD/KRW",
+    "VIXCLS": "VIX",
+    "DFEDTARU": "연준 목표금리 상단",
+    "DFEDTARL": "연준 목표금리 하단",
+    "CPIAUCSL": "CPI",
+    "PCEPI": "PCE",
 }
 
 
@@ -64,6 +76,160 @@ def fetch(url):
             return response.read()
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(f"데이터 요청 실패 ({url}): {exc}") from exc
+
+
+def fetch_fred_series(series_id):
+    start_date = (datetime.now(timezone.utc).date() - timedelta(days=500)).isoformat()
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?" + urllib.parse.urlencode(
+        {"id": series_id, "cosd": start_date}
+    )
+    reader = csv.DictReader(io.StringIO(fetch(url).decode("utf-8-sig")))
+    observations = []
+    for row in reader:
+        raw_value = (row.get(series_id) or "").strip()
+        if not raw_value or raw_value == ".":
+            continue
+        try:
+            observations.append(
+                (datetime.strptime(row["observation_date"], "%Y-%m-%d").date(),
+                 float(raw_value))
+            )
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(f"FRED {series_id} 응답을 해석하지 못했습니다.") from exc
+    if not observations:
+        raise RuntimeError(f"FRED {series_id}에 유효한 관측값이 없습니다.")
+    return observations
+
+
+def _weekly_change(observations):
+    if len(observations) < 6:
+        return None
+    return observations[-1][1] - observations[-6][1]
+
+
+def _inflation_yoy(observations):
+    if len(observations) < 13:
+        return None
+    current_date, current = observations[-1]
+    previous_date, previous_year = observations[-13]
+    if previous_year == 0:
+        return None
+    previous_month_yoy = None
+    if len(observations) >= 14 and observations[-14][1] != 0:
+        previous_month_yoy = (observations[-2][1] / observations[-14][1] - 1) * 100
+    return (
+        current_date,
+        (current / previous_year - 1) * 100,
+        previous_month_yoy,
+    )
+
+
+def format_macro_summary(data, failures=()):
+    alerts = []
+    context = []
+
+    treasury = data.get("DGS10", [])
+    if treasury:
+        latest_date, latest = treasury[-1]
+        weekly_change = _weekly_change(treasury)
+        if weekly_change is not None and abs(weekly_change) >= 0.10:
+            direction = "상승" if weekly_change > 0 else "하락"
+            alerts.append(f"미 10년물 {direction} {abs(weekly_change):.2f}%p/5거래일")
+        context.append(f"미 10년물 {latest:.2f}% ({latest_date:%m-%d})")
+
+    exchange = data.get("DEXKOUS", [])
+    if exchange:
+        latest_date, latest = exchange[-1]
+        weekly_change = _weekly_change(exchange)
+        if weekly_change is not None:
+            base = latest - weekly_change
+            percent_change = weekly_change / base * 100 if base else 0
+            if abs(percent_change) >= 0.5:
+                direction = "원화 약세" if percent_change > 0 else "원화 강세"
+                alerts.append(f"USD/KRW {direction} {percent_change:+.2f}%/5거래일")
+        context.append(f"USD/KRW {latest:,.1f} ({latest_date:%m-%d})")
+
+    volatility = data.get("VIXCLS", [])
+    if volatility:
+        latest_date, latest = volatility[-1]
+        weekly_change = _weekly_change(volatility)
+        weekly_percent = (
+            weekly_change / (latest - weekly_change) * 100
+            if weekly_change is not None and latest != weekly_change else None
+        )
+        if latest >= 20:
+            alerts.append(f"VIX {latest:.1f} (20 이상)")
+        elif weekly_percent is not None and weekly_percent >= 10:
+            alerts.append(f"VIX 주간 {weekly_percent:+.1f}% 급등")
+        context.append(f"VIX {latest:.1f} ({latest_date:%m-%d})")
+
+    upper = data.get("DFEDTARU", [])
+    lower = data.get("DFEDTARL", [])
+    if upper and lower:
+        upper_change = _weekly_change(upper)
+        lower_change = _weekly_change(lower)
+        upper_date, upper_rate = upper[-1]
+        _, lower_rate = lower[-1]
+        if (
+            upper_change is not None and lower_change is not None
+            and (upper_change != 0 or lower_change != 0)
+        ):
+            alerts.append(f"연준 목표금리 변경: {lower_rate:.2f}~{upper_rate:.2f}%")
+        context.append(f"연준 목표금리 {lower_rate:.2f}~{upper_rate:.2f}% ({upper_date:%m-%d})")
+
+    inflation_context = []
+    for series_id in ("CPIAUCSL", "PCEPI"):
+        inflation = _inflation_yoy(data.get(series_id, []))
+        if inflation is None:
+            continue
+        observation_date, yoy, previous_yoy = inflation
+        item = f"{'CPI' if series_id == 'CPIAUCSL' else 'PCE'} 전년비 {yoy:+.1f}% ({observation_date:%Y-%m} 관측)"
+        if previous_yoy is not None:
+            change = yoy - previous_yoy
+            item += f", 전월 관측 대비 {change:+.1f}%p"
+            if abs(change) >= 0.2:
+                alerts.append(
+                    f"{'CPI' if series_id == 'CPIAUCSL' else 'PCE'} 물가상승률 "
+                    f"{'가속' if change > 0 else '둔화'} {abs(change):.1f}%p"
+                )
+        inflation_context.append(item)
+
+    if alerts:
+        headline = "🔔 주요 매크로 업데이트: " + " · ".join(alerts)
+    elif failures:
+        headline = "⚠️ 매크로 일부 지표 미수신: 수신된 지표에서 기준 이상 변동 없음"
+    else:
+        headline = "✅ 주요 매크로 업데이트: 설정 기준 이상의 변동 없음"
+    lines = [headline]
+    if context:
+        lines.append("시장 지표: " + " | ".join(context))
+    if inflation_context:
+        lines.append("물가 최신 관측: " + " | ".join(inflation_context))
+    if failures:
+        lines.append("⚠️ 일부 매크로 지표 조회 실패: " + ", ".join(failures))
+    lines.append(
+        "기준: 10년물 주간 ±0.10%p, USD/KRW ±0.5%, VIX ≥20 또는 주간 +10%, "
+        "연준 목표금리 변경, CPI/PCE 전월 관측 대비 YoY ±0.2%p"
+    )
+    return "\n".join(lines)
+
+
+def get_macro_summary():
+    results = {}
+    failures = []
+    with ThreadPoolExecutor(max_workers=len(MACRO_SERIES)) as executor:
+        futures = {
+            executor.submit(fetch_fred_series, series_id): series_id
+            for series_id in MACRO_SERIES
+        }
+        for future in as_completed(futures):
+            series_id = futures[future]
+            try:
+                results[series_id] = future.result()
+            except (RuntimeError, UnicodeDecodeError, csv.Error) as exc:
+                print(f"FRED {series_id} 조회 실패: {exc}", file=sys.stderr)
+                failures.append(MACRO_SERIES[series_id])
+    return format_macro_summary(results, failures)
 
 
 def get_prices(ticker):
@@ -436,7 +602,11 @@ def create_chart(ticker, stock, rows, currency, output_dir):
 
 def make_report(chart_dir):
     now = datetime.now(SEOUL).strftime("%Y-%m-%d %H:%M")
-    lines = [f"📊 보유 종목 일일 리포트 ({now} KST)"]
+    lines = [
+        f"📊 보유 종목 일일 리포트 ({now} KST)",
+        "",
+        get_macro_summary(),
+    ]
     charts = []
     for ticker, stock in STOCKS.items():
         rows, currency = get_prices(ticker)
@@ -465,7 +635,7 @@ def make_report(chart_dir):
                 lines.append(f"[[ARTICLE_LINK:{link}]]")
     lines.extend([
         "",
-        "뉴스: Google News RSS | 번역: Google Translate | 시세: Yahoo Finance",
+        "매크로: FRED | 뉴스: Google News RSS | 번역: Google Translate | 시세: Yahoo Finance",
         "※ 번역은 자동 처리되어 오역이 있을 수 있습니다. 원문은 링크에서 확인하세요.",
     ])
     return "\n".join(lines), charts
