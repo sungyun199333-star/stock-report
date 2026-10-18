@@ -68,7 +68,7 @@ def fetch(url):
 def get_prices(ticker):
     quote_url = (
         f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        "?range=6mo&interval=1d"
+        "?range=1y&interval=1d"
     )
     payload = json.loads(fetch(quote_url))
     chart = payload.get("chart", {})
@@ -88,10 +88,10 @@ def get_prices(ticker):
         )
         if close is not None and high is not None and low is not None
     ]
-    if len(rows) < 78:
+    if len(rows) < 200:
         raise RuntimeError(
             f"{ticker} 분석 데이터가 부족합니다 "
-            f"({len(rows)}일, 일목 구름 계산에 최소 78일 필요)."
+            f"({len(rows)}일, 200일 이동평균 계산에 최소 200일 필요)."
         )
     currency = result.get("meta", {}).get("currency", "통화 미상")
     return rows, currency
@@ -130,8 +130,24 @@ def analyze(rows, currency):
     macd_values = [a - b for a, b in zip(ema(closes, 12), ema(closes, 26))]
     signal_values = ema(macd_values, 9)
     price = closes[-1]
-    sma20 = sum(closes[-20:]) / 20
-    sma60 = sum(closes[-60:]) / 60
+    moving_averages = {
+        period: sum(closes[-period:]) / period
+        for period in (5, 20, 50, 120, 200)
+    }
+    sma20 = moving_averages[20]
+    bullish_alignment = all(
+        moving_averages[shorter] > moving_averages[longer]
+        for shorter, longer in zip((5, 20, 50, 120), (20, 50, 120, 200))
+    )
+    bearish_alignment = all(
+        moving_averages[shorter] < moving_averages[longer]
+        for shorter, longer in zip((5, 20, 50, 120), (20, 50, 120, 200))
+    )
+    alignment = (
+        "정배열" if bullish_alignment
+        else "역배열" if bearish_alignment
+        else "혼조"
+    )
     stddev20 = (sum((close - sma20) ** 2 for close in closes[-20:]) / 20) ** 0.5
     bollinger_upper = sma20 + 2 * stddev20
     bollinger_lower = sma20 - 2 * stddev20
@@ -148,19 +164,21 @@ def analyze(rows, currency):
     macd, signal = macd_values[-1], signal_values[-1]
     positive_flags = (
         price > sma20,
-        sma20 > sma60,
+        moving_averages[20] > moving_averages[50],
         macd > signal,
         40 <= rsi <= 70,
         price > bollinger_upper,
         price > cloud_top,
+        bullish_alignment,
     )
     negative_flags = (
         price < sma20,
-        sma20 < sma60,
+        moving_averages[20] < moving_averages[50],
         macd < signal,
         rsi > 70,
         price < bollinger_lower,
         price < cloud_bottom,
+        bearish_alignment,
     )
     positive = sum(
         positive_flags
@@ -171,11 +189,12 @@ def analyze(rows, currency):
 
     signal_lines = [
         f"{marker(positive_flags[0], negative_flags[0])} 종가 vs 20일선",
-        f"{marker(positive_flags[1], negative_flags[1])} 20일선 vs 60일선",
+        f"{marker(positive_flags[1], negative_flags[1])} 20일선 vs 50일선",
         f"{marker(positive_flags[2], negative_flags[2])} MACD",
         f"{marker(positive_flags[3], negative_flags[3])} RSI(14)",
         f"{marker(positive_flags[4], negative_flags[4])} 볼린저 밴드 돌파",
         f"{marker(positive_flags[5], negative_flags[5])} 일목 구름대 위치",
+        f"{marker(bullish_alignment, bearish_alignment)} 이동평균선 {alignment}",
     ]
     if positive >= 4 and negative <= 1:
         opinion = "매수 고려 신호: 상승 지표가 우세합니다. 한 번에 진입하기보다 분할 접근을 검토하세요."
@@ -191,7 +210,12 @@ def analyze(rows, currency):
     return (
         f"종가: {price:,.2f} {currency} ({(price / closes[-2] - 1) * 100:+.2f}%)\n"
         f"RSI(14): {rsi:.1f} | MACD: {macd:,.1f} / 신호선 {signal:,.1f}\n"
-        f"20일선: {sma20:,.2f} {currency} | 60일선: {sma60:,.2f} {currency}\n"
+        "이동평균선: "
+        + " | ".join(
+            f"{period}일 {moving_averages[period]:,.2f} {currency}"
+            for period in (5, 20, 50, 120, 200)
+        )
+        + f"\n배열 상태: {alignment} (5 > 20 > 50 > 120 > 200일선 순 정렬 기준)\n"
         f"볼린저 밴드(20, 2σ): 하단 {bollinger_lower:,.2f} {currency} | "
         f"중심 {sma20:,.2f} {currency} | 상단 {bollinger_upper:,.2f} {currency}\n"
         f"현재가 위치: {'상단 밴드 위' if price > bollinger_upper else '하단 밴드 아래' if price < bollinger_lower else '밴드 안'}\n"
@@ -202,7 +226,7 @@ def analyze(rows, currency):
         f"{volumes[-1] / avg_volume:.2f}배)\n"
         "지표별 신호:\n"
         + "\n".join(signal_lines)
-        + f"\n집계: 🟢 상승 {positive}/6 | 🔴 하락·과열 {negative}/6\n"
+        + f"\n집계: 🟢 상승 {positive}/7 | 🔴 하락·과열 {negative}/7\n"
         + f"참고 의견: {opinion_marker} {opinion}\n"
         + "신호 표시: 🟢 긍정 | 🔴 부정 | 🟡 중립\n"
         "※ 과거 가격 지표에 따른 일반 신호이며 개인별 투자 자문이나 수익 보장이 아닙니다. "
@@ -264,7 +288,12 @@ def make_report():
         rows, currency = get_prices(ticker)
         lines.extend(["", f"━━ {stock['name']} ({ticker}) ━━", "[기술적 분석]",
                       analyze(rows, currency), "[최근 24시간 뉴스]"])
-        news = get_news(ticker)
+        try:
+            news = get_news(ticker)
+        except (RuntimeError, ET.ParseError) as exc:
+            print(f"{ticker} 뉴스 조회 실패, 해당 종목 뉴스는 생략합니다: {exc}", file=sys.stderr)
+            lines.append("뉴스 제공처에 연결할 수 없어 이 종목의 뉴스는 생략했습니다.")
+            continue
         if not news:
             lines.append("최근 24시간 내 검색된 관련 뉴스가 없습니다.")
         for index, (title, source, date, description, link) in enumerate(news, 1):
