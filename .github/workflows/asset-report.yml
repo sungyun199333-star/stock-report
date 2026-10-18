@@ -1,0 +1,31 @@
+name: Daily asset Telegram report
+
+on:
+  schedule:
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send-asset-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install report dependencies
+        run: pip install -r requirements.txt
+      - name: Send daily asset report
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          ASSET_SHEET_NAME: ${{ vars.ASSET_SHEET_NAME || 'Sheet1' }}
+          ASSET_DATE_COLUMN: ${{ vars.ASSET_DATE_COLUMN || '날짜' }}
+          ASSET_VALUE_COLUMN: ${{ vars.ASSET_VALUE_COLUMN || '총액(원)' }}
+          ASSET_CURRENCY: ${{ vars.ASSET_CURRENCY || '원' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python asset_report.py
