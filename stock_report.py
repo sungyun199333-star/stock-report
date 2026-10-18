@@ -88,10 +88,10 @@ def get_prices(ticker):
         )
         if close is not None and high is not None and low is not None
     ]
-    if len(rows) < 200:
+    if len(rows) < 78:
         raise RuntimeError(
             f"{ticker} 분석 데이터가 부족합니다 "
-            f"({len(rows)}일, 200일 이동평균 계산에 최소 200일 필요)."
+            f"({len(rows)}일, 일목 구름대 계산에 최소 78일 필요)."
         )
     currency = result.get("meta", {}).get("currency", "통화 미상")
     return rows, currency
@@ -131,20 +131,28 @@ def analyze(rows, currency):
     signal_values = ema(macd_values, 9)
     price = closes[-1]
     moving_averages = {
-        period: sum(closes[-period:]) / period
+        period: sum(closes[-period:]) / period if len(closes) >= period else None
         for period in (5, 20, 50, 120, 200)
     }
     sma20 = moving_averages[20]
-    bullish_alignment = all(
-        moving_averages[shorter] > moving_averages[longer]
-        for shorter, longer in zip((5, 20, 50, 120), (20, 50, 120, 200))
+    alignment_available = all(value is not None for value in moving_averages.values())
+    bullish_alignment = (
+        all(
+            moving_averages[shorter] > moving_averages[longer]
+            for shorter, longer in zip((5, 20, 50, 120), (20, 50, 120, 200))
+        )
+        if alignment_available else None
     )
-    bearish_alignment = all(
-        moving_averages[shorter] < moving_averages[longer]
-        for shorter, longer in zip((5, 20, 50, 120), (20, 50, 120, 200))
+    bearish_alignment = (
+        all(
+            moving_averages[shorter] < moving_averages[longer]
+            for shorter, longer in zip((5, 20, 50, 120), (20, 50, 120, 200))
+        )
+        if alignment_available else None
     )
     alignment = (
-        "정배열" if bullish_alignment
+        "데이터 부족 (200일 미만)" if not alignment_available
+        else "정배열" if bullish_alignment
         else "역배열" if bearish_alignment
         else "혼조"
     )
@@ -180,11 +188,13 @@ def analyze(rows, currency):
         price < cloud_bottom,
         bearish_alignment,
     )
-    positive = sum(
-        positive_flags
-    )
-    negative = sum(negative_flags)
+    positive = sum(flag is True for flag in positive_flags)
+    negative = sum(flag is True for flag in negative_flags)
+    available_signals = sum(flag is not None for flag in positive_flags)
+
     def marker(is_positive, is_negative):
+        if is_positive is None or is_negative is None:
+            return "⚪"
         return "🟢" if is_positive else "🔴" if is_negative else "🟡"
 
     signal_lines = [
@@ -213,6 +223,8 @@ def analyze(rows, currency):
         "이동평균선: "
         + " | ".join(
             f"{period}일 {moving_averages[period]:,.2f} {currency}"
+            if moving_averages[period] is not None
+            else f"{period}일 데이터 부족"
             for period in (5, 20, 50, 120, 200)
         )
         + f"\n배열 상태: {alignment} (5 > 20 > 50 > 120 > 200일선 순 정렬 기준)\n"
@@ -226,9 +238,10 @@ def analyze(rows, currency):
         f"{volumes[-1] / avg_volume:.2f}배)\n"
         "지표별 신호:\n"
         + "\n".join(signal_lines)
-        + f"\n집계: 🟢 상승 {positive}/7 | 🔴 하락·과열 {negative}/7\n"
+        + f"\n집계: 🟢 상승 {positive}/{available_signals} | "
+        + f"🔴 하락·과열 {negative}/{available_signals}\n"
         + f"참고 의견: {opinion_marker} {opinion}\n"
-        + "신호 표시: 🟢 긍정 | 🔴 부정 | 🟡 중립\n"
+        + "신호 표시: 🟢 긍정 | 🔴 부정 | 🟡 중립 | ⚪ 데이터 부족\n"
         "※ 과거 가격 지표에 따른 일반 신호이며 개인별 투자 자문이나 수익 보장이 아닙니다. "
         "보유 단가·투자 기간·위험 감수도는 반영하지 않습니다."
     )
