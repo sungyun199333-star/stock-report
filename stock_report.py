@@ -4,6 +4,7 @@
 import html
 import csv
 import io
+import math
 import argparse
 import json
 import os
@@ -22,18 +23,20 @@ from zoneinfo import ZoneInfo
 SEOUL = ZoneInfo("Asia/Seoul")
 STOCKS = {
     "000660.KS": {"name": "SK하이닉스", "query": "SK하이닉스 OR SK hynix"},
+    "035420.KS": {"name": "NAVER", "query": "NAVER OR 네이버"},
     "TSLA": {"name": "Tesla", "query": "Tesla OR TSLA"},
     "SPCX": {"name": "SPAC and New Issue ETF", "query": '"SPAC and New Issue ETF" OR SPCX'},
     "META": {"name": "Meta Platforms", "query": "Meta Platforms OR META"},
+    "SOXX": {"name": "iShares Semiconductor ETF", "query": '"iShares Semiconductor ETF" OR SOXX'},
 }
 MARKETS = {
     "korea": {
         "name": "한국 주식",
-        "tickers": ("000660.KS",),
+        "tickers": ("000660.KS", "035420.KS"),
     },
     "us": {
         "name": "미국 주식",
-        "tickers": ("TSLA", "SPCX", "META"),
+        "tickers": ("TSLA", "SPCX", "META", "SOXX"),
     },
 }
 MACRO_SERIES = {
@@ -112,6 +115,51 @@ def fetch_fred_series(series_id):
     return observations
 
 
+def fetch_cnn_fear_greed_index(now=None):
+    start_date = (now or datetime.now(SEOUL)).date() - timedelta(days=14)
+    url = (
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata/"
+        f"{start_date.isoformat()}"
+    )
+    try:
+        payload = json.loads(fetch(url))
+        current = payload["fear_and_greed"]
+        score = float(current["score"])
+    except (RuntimeError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"CNN 공포·탐욕지수 응답을 해석하지 못했습니다: {exc}") from exc
+    if not math.isfinite(score) or not 0 <= score <= 100:
+        raise RuntimeError("CNN 공포·탐욕지수 점수가 유효한 범위(0~100)가 아닙니다.")
+
+    timestamp = current.get("timestamp")
+    observed_at = None
+    if isinstance(timestamp, (int, float)):
+        try:
+            observed_at = datetime.fromtimestamp(timestamp, timezone.utc).astimezone(SEOUL)
+        except (OverflowError, OSError, ValueError):
+            observed_at = None
+    elif isinstance(timestamp, str):
+        try:
+            observed_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            observed_at = observed_at.astimezone(SEOUL)
+        except ValueError:
+            observed_at = None
+    return {"score": score, "observed_at": observed_at}
+
+
+def fear_greed_label(score):
+    if score < 25:
+        return "극단적 공포"
+    if score < 45:
+        return "공포"
+    if score <= 55:
+        return "중립"
+    if score < 75:
+        return "탐욕"
+    return "극단적 탐욕"
+
+
 def _weekly_change(observations):
     if len(observations) < 6:
         return None
@@ -135,7 +183,7 @@ def _inflation_yoy(observations):
     )
 
 
-def format_macro_summary(data, failures=()):
+def format_macro_summary(data, failures=(), fear_greed=None):
     alerts = []
     context = []
 
@@ -173,6 +221,17 @@ def format_macro_summary(data, failures=()):
         elif weekly_percent is not None and weekly_percent >= 10:
             alerts.append(f"VIX 주간 {weekly_percent:+.1f}% 급등")
         context.append(f"VIX {latest:.1f} ({latest_date:%m-%d})")
+
+    if fear_greed:
+        score = fear_greed["score"]
+        label = fear_greed_label(score)
+        observed_at = fear_greed.get("observed_at")
+        date_note = f" ({observed_at:%m-%d %H:%M} KST)" if observed_at else ""
+        context.append(f"CNN 공포·탐욕지수 {score:.1f}/100 ({label}){date_note}")
+        if score < 25 or score >= 75:
+            alerts.append(f"CNN 공포·탐욕지수 {label} ({score:.1f}/100)")
+    elif "CNN 공포·탐욕지수" in failures:
+        context.append("CNN 공포·탐욕지수 조회 실패")
 
     upper = data.get("DFEDTARU", [])
     lower = data.get("DFEDTARL", [])
@@ -228,11 +287,13 @@ def format_macro_summary(data, failures=()):
 def get_macro_summary():
     results = {}
     failures = []
-    with ThreadPoolExecutor(max_workers=len(MACRO_SERIES)) as executor:
+    fear_greed = None
+    with ThreadPoolExecutor(max_workers=len(MACRO_SERIES) + 1) as executor:
         futures = {
             executor.submit(fetch_fred_series, series_id): series_id
             for series_id in MACRO_SERIES
         }
+        fear_greed_future = executor.submit(fetch_cnn_fear_greed_index)
         for future in as_completed(futures):
             series_id = futures[future]
             try:
@@ -240,7 +301,12 @@ def get_macro_summary():
             except (RuntimeError, UnicodeDecodeError, csv.Error) as exc:
                 print(f"FRED {series_id} 조회 실패: {exc}", file=sys.stderr)
                 failures.append(MACRO_SERIES[series_id])
-    return format_macro_summary(results, failures)
+        try:
+            fear_greed = fear_greed_future.result()
+        except RuntimeError as exc:
+            print(f"CNN 공포·탐욕지수 조회 실패: {exc}", file=sys.stderr)
+            failures.append("CNN 공포·탐욕지수")
+    return format_macro_summary(results, failures, fear_greed)
 
 
 def get_prices(ticker):
@@ -278,6 +344,46 @@ def get_prices(ticker):
         )
     currency = result.get("meta", {}).get("currency", "통화 미상")
     return rows, currency
+
+
+def get_korea_investor_flow(ticker, now=None):
+    try:
+        from pykrx import stock as krx_stock
+        from requests.exceptions import RequestException
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("pykrx 수급 데이터 의존성이 설치되지 않았습니다.") from exc
+
+    latest_query_date = (now or datetime.now(SEOUL)).date() - timedelta(days=1)
+    first_query_date = latest_query_date - timedelta(days=14)
+    krx_ticker = ticker.removesuffix(".KS")
+    try:
+        rows = krx_stock.get_market_trading_value_by_date(
+            first_query_date.strftime("%Y%m%d"),
+            latest_query_date.strftime("%Y%m%d"),
+            krx_ticker,
+        )
+        if rows.empty:
+            return None
+        latest = rows.iloc[-1]
+        return {
+            "date": rows.index[-1].strftime("%Y-%m-%d"),
+            "개인": int(latest["개인"]),
+            "외국인": int(latest["외국인합계"]),
+            "기관": int(latest["기관합계"]),
+        }
+    except (RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{ticker} KRX 투자자 수급 응답을 처리하지 못했습니다: {exc}") from exc
+
+
+def format_investor_flow(flow):
+    if flow is None:
+        return "자료 없음"
+    lines = [f"기준일 {flow['date']} · 순매수(매수액−매도액)"]
+    for investor in ("개인", "외국인", "기관"):
+        value = flow[investor]
+        direction = "순매수" if value > 0 else "순매도" if value < 0 else "중립"
+        lines.append(f"{investor} {direction} {abs(value) / 100_000_000:,.1f}억 원")
+    return "\n".join(lines)
 
 
 def midpoint(highs, lows, period, index):
@@ -631,7 +737,15 @@ def make_report(chart_dir, market="all"):
             (ticker, stock["name"], create_chart(ticker, stock, rows, currency, chart_dir))
         )
         lines.extend(["", f"━━ {stock['name']} ({ticker}) ━━", "[기술적 분석]",
-                      analyze(rows, currency), "[최근 24시간 뉴스]"])
+                      analyze(rows, currency)])
+        if ticker in MARKETS["korea"]["tickers"]:
+            lines.append("[투자자별 수급 · KRX 거래대금 순매수]")
+            try:
+                lines.append(format_investor_flow(get_korea_investor_flow(ticker)))
+            except RuntimeError as exc:
+                print(f"{ticker} 투자자 수급 조회 실패: {exc}", file=sys.stderr)
+                lines.append("수급 자료를 조회할 수 없습니다.")
+        lines.append("[최근 24시간 뉴스]")
         try:
             news = get_news(ticker)
         except (RuntimeError, ET.ParseError) as exc:
@@ -652,8 +766,10 @@ def make_report(chart_dir, market="all"):
                 lines.append(f"[[ARTICLE_LINK:{link}]]")
     lines.extend([
         "",
-        "매크로: FRED | 뉴스: Google News RSS | 번역: Google Translate | 시세: Yahoo Finance",
+        "매크로: FRED·CNN 공포탐욕지수 | 수급: KRX(PyKrx) | 뉴스: Google News RSS | "
+        "번역: Google Translate | 시세: Yahoo Finance",
         "※ 번역은 자동 처리되어 오역이 있을 수 있습니다. 원문은 링크에서 확인하세요.",
+        "※ KRX 투자자별 수급은 참고용 순매수 거래대금입니다.",
     ])
     return "\n".join(lines), charts
 
