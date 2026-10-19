@@ -4,6 +4,7 @@
 import html
 import csv
 import io
+import argparse
 import json
 import os
 import re
@@ -24,6 +25,16 @@ STOCKS = {
     "TSLA": {"name": "Tesla", "query": "Tesla OR TSLA"},
     "SPCX": {"name": "SPAC and New Issue ETF", "query": '"SPAC and New Issue ETF" OR SPCX'},
     "META": {"name": "Meta Platforms", "query": "Meta Platforms OR META"},
+}
+MARKETS = {
+    "korea": {
+        "name": "한국 주식",
+        "tickers": ("000660.KS",),
+    },
+    "us": {
+        "name": "미국 주식",
+        "tickers": ("TSLA", "SPCX", "META"),
+    },
 }
 MACRO_SERIES = {
     "DGS10": "미 10년물 금리",
@@ -600,15 +611,21 @@ def create_chart(ticker, stock, rows, currency, output_dir):
     return chart_path
 
 
-def make_report(chart_dir):
+def make_report(chart_dir, market="all"):
     now = datetime.now(SEOUL).strftime("%Y-%m-%d %H:%M")
+    tickers = (
+        tuple(ticker for details in MARKETS.values() for ticker in details["tickers"])
+        if market == "all" else MARKETS[market]["tickers"]
+    )
+    market_name = "전체 종목" if market == "all" else MARKETS[market]["name"]
     lines = [
-        f"📊 보유 종목 일일 리포트 ({now} KST)",
+        f"📊 {market_name} 일일 리포트 ({now} KST)",
         "",
         get_macro_summary(),
     ]
     charts = []
-    for ticker, stock in STOCKS.items():
+    for ticker in tickers:
+        stock = STOCKS[ticker]
         rows, currency = get_prices(ticker)
         charts.append(
             (ticker, stock["name"], create_chart(ticker, stock, rows, currency, chart_dir))
@@ -639,6 +656,16 @@ def make_report(chart_dir):
         "※ 번역은 자동 처리되어 오역이 있을 수 있습니다. 원문은 링크에서 확인하세요.",
     ])
     return "\n".join(lines), charts
+
+
+def should_run_us_schedule(schedule, now=None):
+    if not schedule:
+        return True
+    now = now or datetime.now(ZoneInfo("America/New_York"))
+    summer_cron = "30 20 * * 1-5"
+    winter_cron = "30 21 * * 1-5"
+    expected_cron = summer_cron if now.dst() != timedelta(0) else winter_cron
+    return schedule == expected_cron
 
 
 def telegram_html(message):
@@ -746,8 +773,22 @@ def send_chart(ticker, name, image_path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Send market-specific daily stock reports.")
+    parser.add_argument("--market", choices=("korea", "us", "all"), default="all")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="Skip the US report when this workflow run is for the inactive DST schedule.",
+    )
+    args = parser.parse_args()
     try:
-        if "--dry-run" in sys.argv[1:]:
+        if args.scheduled and args.market == "us":
+            schedule = os.environ.get("GITHUB_EVENT_SCHEDULE", "")
+            if not should_run_us_schedule(schedule):
+                print("이 UTC 일정은 현재 미국 서머타임 기간에 해당하지 않아 전송을 건너뜁니다.")
+                return 0
+        if args.dry_run:
             chart_dir = os.path.join(os.getcwd(), "stock_chart_preview")
             os.makedirs(chart_dir, exist_ok=True)
             temporary_charts = None
@@ -755,8 +796,8 @@ def main():
             temporary_charts = tempfile.TemporaryDirectory(prefix="stock-report-charts-")
             chart_dir = temporary_charts.name
         try:
-            report, charts = make_report(chart_dir)
-            if "--dry-run" in sys.argv[1:]:
+            report, charts = make_report(chart_dir, args.market)
+            if args.dry_run:
                 print(
                     re.sub(
                         r"\[\[ARTICLE_LINK:(https?://[^\]\s]+)\]\]",
