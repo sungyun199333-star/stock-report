@@ -4,10 +4,30 @@ from datetime import datetime
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from stock_report import make_report, should_run_us_schedule
+from stock_report import analyze, make_report, should_run_us_schedule
 
 
 class MarketReportTests(unittest.TestCase):
+    def test_moving_averages_are_listed_in_descending_price_order(self):
+        closes = list(range(220, 0, -1))
+        rows = [
+            (float(close), 1000, float(close + 1), float(close - 1), float(close),
+             datetime(2026, 10, 16, tzinfo=ZoneInfo("UTC")))
+            for close in closes
+        ]
+
+        analysis = analyze(rows, "USD")
+        moving_average_line = analysis.splitlines()[2]
+        alignment_line = analysis.splitlines()[3]
+
+        self.assertIn("200일 100.50 USD | 120일 60.50 USD", moving_average_line)
+        self.assertIn("50일 25.50 USD | 20일 10.50 USD | 5일 3.00 USD", moving_average_line)
+        self.assertIn(
+            "가격순: 200일선 > 120일선 > 50일선 > 20일선 > 5일선",
+            alignment_line,
+        )
+        self.assertIn("배열 상태: 역배열", alignment_line)
+
     def test_korea_and_us_reports_only_include_their_market_tickers(self):
         sample_rows = [
             (100.0, 1000, 101.0, 99.0, 99.5, datetime(2026, 10, 16, tzinfo=ZoneInfo("UTC")))

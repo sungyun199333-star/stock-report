@@ -445,6 +445,14 @@ def analyze(rows, currency):
         else "역배열" if bearish_alignment
         else "혼조"
     )
+    ranked_averages = sorted(
+        moving_averages.items(),
+        key=lambda item: (item[1] is None, -(item[1] or 0)),
+    )
+    moving_average_order = " > ".join(
+        f"{period}일선" if value is not None else f"{period}일선(데이터 부족)"
+        for period, value in ranked_averages
+    )
     stddev20 = (sum((close - sma20) ** 2 for close in closes[-20:]) / 20) ** 0.5
     bollinger_upper = sma20 + 2 * stddev20
     bollinger_lower = sma20 - 2 * stddev20
@@ -511,12 +519,12 @@ def analyze(rows, currency):
         f"RSI(14): {rsi:.1f} | MACD: {macd:,.1f} / 신호선 {signal:,.1f}\n"
         "이동평균선: "
         + " | ".join(
-            f"{period}일 {moving_averages[period]:,.2f} {currency}"
-            if moving_averages[period] is not None
+            f"{period}일 {value:,.2f} {currency}"
+            if value is not None
             else f"{period}일 데이터 부족"
-            for period in (5, 20, 50, 120, 200)
+            for period, value in ranked_averages
         )
-        + f"\n배열 상태: {alignment} (5 > 20 > 50 > 120 > 200일선 순 정렬 기준)\n"
+        + f"\n배열 상태: {alignment} (가격순: {moving_average_order})\n"
         f"볼린저 밴드(20, 2σ): 하단 {bollinger_lower:,.2f} {currency} | "
         f"중심 {sma20:,.2f} {currency} | 상단 {bollinger_upper:,.2f} {currency}\n"
         f"현재가 위치: {'상단 밴드 위' if price > bollinger_upper else '하단 밴드 아래' if price < bollinger_lower else '밴드 안'}\n"
