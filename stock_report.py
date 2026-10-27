@@ -355,6 +355,114 @@ def get_prices(ticker):
     return rows, currency
 
 
+def _option_chain_from_payload(payload, ticker):
+    results = payload.get("optionChain", {}).get("result") or []
+    if not results:
+        raise RuntimeError(f"{ticker} 옵션 체인 데이터가 없습니다.")
+    result = results[0]
+    expirations = result.get("expirationDates") or []
+    options = result.get("options") or []
+    if not expirations or not options:
+        raise RuntimeError(f"{ticker} 옵션 만기 또는 체인 자료가 없습니다.")
+    return expirations, options[0]
+
+
+def get_option_interest_levels(ticker, current_price, now=None):
+    if current_price <= 0:
+        raise RuntimeError(f"{ticker} 현재가가 유효하지 않습니다.")
+
+    today = (now or datetime.now(timezone.utc)).date()
+    initial_url = f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}"
+    try:
+        initial_payload = json.loads(fetch(initial_url))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{ticker} 옵션 체인 응답을 해석할 수 없습니다: {exc}") from exc
+    expirations, initial_chain = _option_chain_from_payload(initial_payload, ticker)
+    last_date = today + timedelta(days=45)
+    selected_expirations = [
+        expiration
+        for expiration in expirations
+        if today <= datetime.fromtimestamp(expiration, timezone.utc).date() <= last_date
+    ][:3]
+    if not selected_expirations:
+        raise RuntimeError(f"{ticker} 향후 45일 내 옵션 만기가 없습니다.")
+
+    chains = {selected_expirations[0]: initial_chain}
+    for expiration in selected_expirations[1:]:
+        url = f"{initial_url}?date={expiration}"
+        try:
+            payload = json.loads(fetch(url))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{ticker} 옵션 체인 응답을 해석할 수 없습니다: {exc}") from exc
+        returned_expirations, chain = _option_chain_from_payload(payload, ticker)
+        if expiration not in returned_expirations:
+            raise RuntimeError(f"{ticker} 요청한 옵션 만기 자료가 응답에 없습니다.")
+        chains[expiration] = chain
+
+    low_strike, high_strike = current_price * 0.85, current_price * 1.15
+    totals = {"calls": {}, "puts": {}}
+    for chain in chains.values():
+        for side in ("calls", "puts"):
+            for contract in chain.get(side, []):
+                strike = contract.get("strike")
+                open_interest = contract.get("openInterest")
+                if strike is None or open_interest is None:
+                    continue
+                strike = float(strike)
+                if not low_strike <= strike <= high_strike:
+                    continue
+                volume = contract.get("volume") or 0
+                level = totals[side].setdefault(strike, {"open_interest": 0, "volume": 0})
+                level["open_interest"] += int(open_interest)
+                level["volume"] += int(volume)
+
+    levels = {
+        side: sorted(
+            (
+                (strike, values["open_interest"], values["volume"])
+                for strike, values in strike_totals.items()
+                if values["open_interest"] > 0
+            ),
+            key=lambda item: (-item[1], abs(item[0] - current_price)),
+        )[:3]
+        for side, strike_totals in totals.items()
+    }
+    if not levels["calls"] and not levels["puts"]:
+        raise RuntimeError(f"{ticker} 주가 ±15% 범위에서 확인 가능한 미결제약정이 없습니다.")
+
+    return {
+        "expirations": [
+            datetime.fromtimestamp(expiration, timezone.utc).date()
+            for expiration in selected_expirations
+        ],
+        "calls": levels["calls"],
+        "puts": levels["puts"],
+    }
+
+
+def format_option_interest_levels(levels, current_price):
+    expiration_text = ", ".join(
+        expiration.strftime("%m/%d") for expiration in levels["expirations"]
+    )
+
+    def format_levels(side):
+        if not levels[side]:
+            return "자료 없음"
+        return " | ".join(
+            f"${strike:,.2f} (OI {open_interest:,}, 거래량 {volume:,}, "
+            f"{(strike / current_price - 1) * 100:+.1f}%)"
+            for strike, open_interest, volume in levels[side]
+        )
+
+    return (
+        f"집계 만기: {expiration_text} (향후 45일 중 최대 3개) | "
+        f"주가 ±15% 행사가\n"
+        f"콜 OI 집중: {format_levels('calls')}\n"
+        f"풋 OI 집중: {format_levels('puts')}\n"
+        "※ OI는 미결제 계약의 누적 잔량이며 당일 매수·매도 방향을 뜻하지 않습니다."
+    )
+
+
 def calculate_rsi_series(closes, period=14):
     values = [None] * len(closes)
     if len(closes) <= period:
@@ -920,7 +1028,9 @@ def get_news(ticker):
     ]
 
 
-def create_chart(ticker, stock, rows, currency, output_dir, divergences=None):
+def create_chart(
+    ticker, stock, rows, currency, output_dir, divergences=None, option_levels=None
+):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -988,6 +1098,34 @@ def create_chart(ticker, stock, rows, currency, output_dir, divergences=None):
                       edgecolor=color, linewidth=0.7)
         )
         volume_ax.bar(index, volumes[index], color=color, width=0.65, alpha=0.75)
+
+    if option_levels:
+        option_level_items = [
+            (side, strike, open_interest)
+            for side in ("calls", "puts")
+            for strike, open_interest, _volume in option_levels.get(side, [])
+        ]
+        for index, (side, strike, open_interest) in enumerate(option_level_items):
+            color = "#138a5b" if side == "calls" else "#c23b45"
+            price_ax.axhline(
+                strike,
+                color=color,
+                linewidth=1.1,
+                linestyle="--" if side == "calls" else ":",
+                alpha=0.8,
+            )
+            price_ax.annotate(
+                f"{'C' if side == 'calls' else 'P'} ${strike:,.2f} "
+                f"OI {open_interest:,}",
+                xy=(count - 1, strike),
+                xytext=(5, 6 if index % 2 == 0 else -9),
+                textcoords="offset points",
+                color=color,
+                fontsize=7,
+                fontweight="bold",
+                va="center",
+                clip_on=False,
+            )
 
     daily_rsi_values = calculate_rsi_series(closes)
     if isinstance(divergences, RsiDivergenceReport):
@@ -1169,7 +1307,7 @@ def create_chart(ticker, stock, rows, currency, output_dir, divergences=None):
     volume_ax.grid(True, axis="y", alpha=0.2)
     price_ax.legend(loc="upper left", ncol=3, fontsize=8, framealpha=0.9)
     tick_positions = list(range(start, count, max(1, (count - start) // 6)))
-    price_ax.set_xlim(start - 1, count)
+    price_ax.set_xlim(start - 1, count + (12 if option_levels else 0))
     rsi_ax.set_xticks(tick_positions)
     rsi_ax.set_xticklabels(
         [dates[index].strftime("%b %d") for index in tick_positions],
@@ -1206,6 +1344,12 @@ def make_report(chart_dir, market="all"):
                 "1일봉": "조회 실패",
                 "1주봉": "조회 실패",
             }
+        option_levels = None
+        if ticker in MARKETS["us"]["tickers"]:
+            try:
+                option_levels = get_option_interest_levels(ticker, rows[-1][0])
+            except RuntimeError as exc:
+                print(f"{ticker} 옵션 OI 조회 실패: {exc}", file=sys.stderr)
         charts.append(
             (
                 ticker,
@@ -1217,6 +1361,7 @@ def make_report(chart_dir, market="all"):
                     currency,
                     chart_dir,
                     divergences,
+                    option_levels,
                 ),
             )
         )
@@ -1230,6 +1375,12 @@ def make_report(chart_dir, market="all"):
             except RuntimeError as exc:
                 print(f"{ticker} 투자자 수급 조회 실패: {exc}", file=sys.stderr)
                 lines.append("수급 자료를 조회할 수 없습니다.")
+        if ticker in MARKETS["us"]["tickers"]:
+            lines.append("[옵션 행사가별 미결제약정 · 향후 45일]")
+            if option_levels is not None:
+                lines.append(format_option_interest_levels(option_levels, rows[-1][0]))
+            else:
+                lines.append("옵션 미결제약정 자료를 조회할 수 없습니다.")
         lines.append("[최근 24시간 뉴스]")
         try:
             news = get_news(ticker)
@@ -1251,10 +1402,11 @@ def make_report(chart_dir, market="all"):
                 lines.append(f"[[ARTICLE_LINK:{link}]]")
     lines.extend([
         "",
-        "매크로: FRED·CNN 공포탐욕지수 | 수급: KRX(PyKrx) | 뉴스: Google News RSS | "
-        "번역: Google Translate | 시세: Yahoo Finance",
+        "매크로: FRED·CNN 공포탐욕지수 | 수급: KRX(PyKrx) | 옵션: Yahoo Finance | "
+        "뉴스: Google News RSS | 번역: Google Translate | 시세: Yahoo Finance",
         "※ 번역은 자동 처리되어 오역이 있을 수 있습니다. 원문은 링크에서 확인하세요.",
         "※ KRX 투자자별 수급은 참고용 순매수 거래대금입니다.",
+        "※ 옵션 OI 집중 구간은 향후 45일 내 최대 3개 만기의 미결제약정을 합산한 참고치입니다.",
     ])
     return "\n".join(lines), charts
 

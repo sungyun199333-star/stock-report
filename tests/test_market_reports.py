@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from datetime import datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -12,6 +13,8 @@ from stock_report import (
     detect_rsi_divergence,
     detect_rsi_divergence_details,
     format_rsi_divergences,
+    format_option_interest_levels,
+    get_option_interest_levels,
     get_rsi_divergences,
     make_report,
     RsiDivergenceReport,
@@ -20,6 +23,57 @@ from stock_report import (
 
 
 class MarketReportTests(unittest.TestCase):
+    def test_option_interest_levels_aggregate_nearby_expirations_by_strike(self):
+        now = datetime(2026, 1, 1, tzinfo=ZoneInfo("UTC"))
+        expirations = [
+            int((now + timedelta(days=days)).timestamp())
+            for days in (10, 20, 50)
+        ]
+
+        def payload(chain):
+            return json.dumps(
+                {
+                    "optionChain": {
+                        "result": [
+                            {
+                                "expirationDates": expirations,
+                                "options": [chain],
+                            }
+                        ]
+                    }
+                }
+            ).encode()
+
+        first_chain = {
+            "calls": [
+                {"strike": 100, "openInterest": 100, "volume": 10},
+                {"strike": 105, "openInterest": 200, "volume": 20},
+                {"strike": 120, "openInterest": 999, "volume": 99},
+            ],
+            "puts": [{"strike": 95, "openInterest": 150, "volume": 15}],
+        }
+        second_chain = {
+            "calls": [{"strike": 100, "openInterest": 250, "volume": 25}],
+            "puts": [{"strike": 95, "openInterest": 350, "volume": 35}],
+        }
+        with patch(
+            "stock_report.fetch",
+            side_effect=[payload(first_chain), payload(second_chain)],
+        ) as fetch:
+            levels = get_option_interest_levels("TSLA", 100, now)
+
+        self.assertEqual(len(fetch.call_args_list), 2)
+        self.assertEqual(levels["expirations"], [
+            (now + timedelta(days=10)).date(),
+            (now + timedelta(days=20)).date(),
+        ])
+        self.assertEqual(levels["calls"], [(100.0, 350, 35), (105.0, 200, 20)])
+        self.assertEqual(levels["puts"], [(95.0, 500, 50)])
+        formatted = format_option_interest_levels(levels, 100)
+        self.assertIn("콜 OI 집중: $100.00 (OI 350", formatted)
+        self.assertIn("풋 OI 집중: $95.00 (OI 500", formatted)
+        self.assertIn("당일 매수·매도 방향을 뜻하지 않습니다", formatted)
+
     def test_rsi_series_uses_wilder_smoothing_and_requires_warmup(self):
         closes = [float(value) for value in range(1, 31)]
         rsi_values = calculate_rsi_series(closes)
@@ -209,6 +263,14 @@ class MarketReportTests(unittest.TestCase):
                 ),
                 patch("stock_report.get_news", return_value=[]),
                 patch(
+                    "stock_report.get_option_interest_levels",
+                    return_value={
+                        "expirations": [datetime(2026, 10, 23).date()],
+                        "calls": [(105.0, 1200, 300)],
+                        "puts": [(95.0, 900, 200)],
+                    },
+                ) as get_option_levels,
+                patch(
                     "stock_report.get_korea_investor_flow",
                     return_value={
                         "date": "2026-10-16",
@@ -239,6 +301,20 @@ class MarketReportTests(unittest.TestCase):
             [divergence["4시간봉"] for divergence in chart_divergences],
             ["상승 다이버전스"] * 2 + ["상승 다이버전스"] * 4,
         )
+        chart_option_levels = [
+            call.args[6] for call in create_chart.call_args_list
+        ]
+        self.assertEqual(
+            chart_option_levels,
+            [None, None]
+            + [
+                {
+                    "expirations": [datetime(2026, 10, 23).date()],
+                    "calls": [(105.0, 1200, 300)],
+                    "puts": [(95.0, 900, 200)],
+                }
+            ] * 4,
+        )
         self.assertNotIn("SK하이닉스 (000660.KS)", us_report)
         self.assertNotIn("NAVER (035420.KS)", us_report)
         self.assertEqual(
@@ -248,6 +324,13 @@ class MarketReportTests(unittest.TestCase):
         self.assertIn("외국인 순매도 2.0억 원", korea_report)
         self.assertIn("기관 중립 0.0억 원", korea_report)
         self.assertNotIn("[투자자별 수급", us_report)
+        self.assertNotIn("[옵션 행사가별", korea_report)
+        self.assertIn("[옵션 행사가별 미결제약정", us_report)
+        self.assertIn("콜 OI 집중: $105.00", us_report)
+        self.assertEqual(
+            [call.args[0] for call in get_option_levels.call_args_list],
+            ["TSLA", "SPCX", "META", "SOXX"],
+        )
         self.assertEqual(
             [call.args[0] for call in get_investor_flow.call_args_list],
             ["000660.KS", "035420.KS"],
