@@ -1,13 +1,116 @@
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from stock_report import analyze, make_report, should_run_us_schedule
+from stock_report import (
+    aggregate_four_hour_closes,
+    aggregate_weekly_closes,
+    analyze,
+    calculate_rsi_series,
+    detect_rsi_divergence,
+    format_rsi_divergences,
+    make_report,
+    should_run_us_schedule,
+)
 
 
 class MarketReportTests(unittest.TestCase):
+    def test_rsi_series_uses_wilder_smoothing_and_requires_warmup(self):
+        closes = [float(value) for value in range(1, 31)]
+        rsi_values = calculate_rsi_series(closes)
+
+        self.assertTrue(all(value is None for value in rsi_values[:14]))
+        self.assertTrue(all(value == 100.0 for value in rsi_values[14:]))
+        self.assertEqual(
+            calculate_rsi_series(closes[:14]),
+            [None] * 14,
+        )
+
+    def test_detects_bullish_and_bearish_rsi_divergence_from_confirmed_swings(self):
+        closes_for_bullish = [100.0] * 30
+        closes_for_bullish[10] = 90.0
+        closes_for_bullish[25] = 85.0
+        bullish_rsi = [50.0] * 30
+        bullish_rsi[10] = 30.0
+        bullish_rsi[25] = 40.0
+
+        closes_for_bearish = [100.0] * 30
+        closes_for_bearish[10] = 110.0
+        closes_for_bearish[25] = 115.0
+        bearish_rsi = [50.0] * 30
+        bearish_rsi[10] = 70.0
+        bearish_rsi[25] = 60.0
+
+        self.assertEqual(
+            detect_rsi_divergence(closes_for_bullish, bullish_rsi),
+            "상승 다이버전스",
+        )
+        self.assertEqual(
+            detect_rsi_divergence(closes_for_bearish, bearish_rsi),
+            "하락 다이버전스",
+        )
+        self.assertEqual(
+            detect_rsi_divergence(
+                closes_for_bullish + [100.0] * 5,
+                bullish_rsi + [50.0] * 5,
+            ),
+            "감지 없음",
+        )
+
+    def test_aggregates_hourly_closes_into_session_four_hour_bars(self):
+        market_tz = ZoneInfo("America/New_York")
+        hourly_bars = [
+            (datetime(2026, 10, 19, 9, 30, tzinfo=market_tz) + timedelta(hours=index),
+             float(index + 1))
+            for index in range(7)
+        ]
+
+        self.assertEqual(
+            aggregate_four_hour_closes(hourly_bars, "America/New_York"),
+            [4.0, 7.0],
+        )
+
+    def test_weekly_closes_exclude_unfinished_week_before_friday_close(self):
+        market_tz = ZoneInfo("America/New_York")
+        daily_rows = [
+            (100.0, 1000, 101.0, 99.0, 99.5,
+             datetime(2026, 10, 15, 16, tzinfo=market_tz)),
+            (101.0, 1000, 102.0, 100.0, 100.5,
+             datetime(2026, 10, 16, 16, tzinfo=market_tz)),
+            (102.0, 1000, 103.0, 101.0, 101.5,
+             datetime(2026, 10, 19, 16, tzinfo=market_tz)),
+        ]
+
+        before_close = aggregate_weekly_closes(
+            daily_rows,
+            "America/New_York",
+            datetime(2026, 10, 16, 15, 59, tzinfo=market_tz),
+        )
+        after_close = aggregate_weekly_closes(
+            daily_rows,
+            "America/New_York",
+            datetime(2026, 10, 16, 16, 30, tzinfo=market_tz),
+        )
+
+        self.assertEqual(before_close, [])
+        self.assertEqual(after_close, [101.0])
+
+    def test_formats_divergence_with_emphasis_and_timeframe_labels(self):
+        message = format_rsi_divergences(
+            {
+                "4시간봉": "상승 다이버전스",
+                "1일봉": "하락 다이버전스",
+                "1주봉": "감지 없음",
+            }
+        )
+
+        self.assertIn("🚨 RSI 다이버전스 감지 🚨", message)
+        self.assertIn("4시간봉: 🟢 상승 다이버전스", message)
+        self.assertIn("1일봉: 🔴 하락 다이버전스", message)
+        self.assertIn("1주봉: — 감지 없음", message)
+
     def test_moving_averages_are_listed_in_descending_price_order(self):
         closes = list(range(220, 0, -1))
         rows = [
@@ -38,6 +141,14 @@ class MarketReportTests(unittest.TestCase):
                 patch("stock_report.get_macro_summary", return_value="macro"),
                 patch("stock_report.get_prices", return_value=(sample_rows, "USD")),
                 patch("stock_report.create_chart", side_effect=lambda ticker, *_: f"{ticker}.png"),
+                patch(
+                    "stock_report.get_rsi_divergences",
+                    return_value={
+                        "4시간봉": "상승 다이버전스",
+                        "1일봉": "감지 없음",
+                        "1주봉": "감지 없음",
+                    },
+                ),
                 patch("stock_report.get_news", return_value=[]),
                 patch(
                     "stock_report.get_korea_investor_flow",
@@ -62,6 +173,7 @@ class MarketReportTests(unittest.TestCase):
         self.assertIn("SPAC and New Issue ETF (SPCX)", us_report)
         self.assertIn("Meta Platforms (META)", us_report)
         self.assertIn("iShares Semiconductor ETF (SOXX)", us_report)
+        self.assertIn("🚨 RSI 다이버전스 감지 🚨", korea_report)
         self.assertNotIn("SK하이닉스 (000660.KS)", us_report)
         self.assertNotIn("NAVER (035420.KS)", us_report)
         self.assertEqual(

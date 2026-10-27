@@ -346,6 +346,237 @@ def get_prices(ticker):
     return rows, currency
 
 
+def calculate_rsi_series(closes, period=14):
+    values = [None] * len(closes)
+    if len(closes) <= period:
+        return values
+
+    changes = [current - previous for previous, current in zip(closes, closes[1:])]
+    average_gain = sum(max(change, 0) for change in changes[:period]) / period
+    average_loss = sum(max(-change, 0) for change in changes[:period]) / period
+
+    def rsi_value(gain, loss):
+        if loss == 0:
+            return 100.0 if gain > 0 else 50.0
+        return 100 - 100 / (1 + gain / loss)
+
+    values[period] = rsi_value(average_gain, average_loss)
+    for index, change in enumerate(changes[period:], start=period + 1):
+        average_gain = (average_gain * (period - 1) + max(change, 0)) / period
+        average_loss = (average_loss * (period - 1) + max(-change, 0)) / period
+        values[index] = rsi_value(average_gain, average_loss)
+    return values
+
+
+def detect_rsi_divergence(
+    closes,
+    rsi_values,
+    pivot_width=2,
+    lookback=80,
+    max_bars_since_pivot=4,
+    min_pivot_separation=5,
+):
+    if len(closes) < 14 + (2 * pivot_width) + min_pivot_separation + 1:
+        return "데이터 부족"
+
+    start = max(0, len(closes) - lookback)
+    low_pivots = []
+    high_pivots = []
+    first_valid_rsi = next(
+        (index for index, value in enumerate(rsi_values) if value is not None),
+        len(closes),
+    )
+    for index in range(
+        max(start + pivot_width, first_valid_rsi),
+        len(closes) - pivot_width,
+    ):
+        if rsi_values[index] is None:
+            continue
+        left = closes[index - pivot_width:index]
+        right = closes[index + 1:index + pivot_width + 1]
+        current = closes[index]
+        if (
+            all(current <= value for value in left + right)
+            and any(current < value for value in left)
+            and any(current < value for value in right)
+        ):
+            low_pivots.append(index)
+        if (
+            all(current >= value for value in left + right)
+            and any(current > value for value in left)
+            and any(current > value for value in right)
+        ):
+            high_pivots.append(index)
+
+    def latest_pair(pivots):
+        if not pivots or len(closes) - 1 - pivots[-1] > max_bars_since_pivot:
+            return None
+        latest = pivots[-1]
+        previous = next(
+            (index for index in reversed(pivots[:-1])
+             if latest - index >= min_pivot_separation),
+            None,
+        )
+        return (previous, latest) if previous is not None else None
+
+    pair = latest_pair(low_pivots)
+    if pair:
+        previous, latest = pair
+        if closes[latest] < closes[previous] and rsi_values[latest] > rsi_values[previous]:
+            return "상승 다이버전스"
+
+    pair = latest_pair(high_pivots)
+    if pair:
+        previous, latest = pair
+        if closes[latest] > closes[previous] and rsi_values[latest] < rsi_values[previous]:
+            return "하락 다이버전스"
+    return "감지 없음"
+
+
+def get_hourly_closes(ticker):
+    params = urllib.parse.urlencode(
+        {"range": "3mo", "interval": "1h", "includePrePost": "false"}
+    )
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?{params}"
+    try:
+        payload = json.loads(fetch(url))
+    except (RuntimeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{ticker} 시간봉 데이터를 가져오지 못했습니다: {exc}") from exc
+    try:
+        chart = payload.get("chart", {})
+        if chart.get("error"):
+            raise RuntimeError(f"{ticker} 시간봉 데이터 오류: {chart['error']}")
+        results = chart.get("result") or []
+        if not results:
+            raise RuntimeError(f"{ticker} 시간봉 데이터가 없습니다.")
+
+        result = results[0]
+        metadata = result.get("meta", {})
+        timezone_name = metadata.get("exchangeTimezoneName")
+        if not timezone_name:
+            raise RuntimeError(f"{ticker} 거래소 시간대 정보가 없습니다.")
+        exchange_timezone = ZoneInfo(timezone_name)
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
+        closes = quote.get("close") or []
+        bars = [
+            (
+                datetime.fromtimestamp(timestamp, timezone.utc).astimezone(exchange_timezone),
+                float(close),
+            )
+            for timestamp, close in zip(result.get("timestamp") or [], closes)
+            if close is not None
+        ]
+    except RuntimeError:
+        raise
+    except (AttributeError, IndexError, KeyError, OSError, OverflowError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{ticker} 시간봉 응답을 해석하지 못했습니다: {exc}") from exc
+    return bars, timezone_name
+
+
+def aggregate_four_hour_closes(hourly_bars, timezone_name):
+    exchange_timezone = ZoneInfo(timezone_name)
+    daily_bars = {}
+    for timestamp, close in hourly_bars:
+        local_timestamp = timestamp.astimezone(exchange_timezone)
+        daily_bars.setdefault(local_timestamp.date(), []).append(
+            (local_timestamp, close)
+        )
+
+    closes = []
+    for trading_date in sorted(daily_bars):
+        bars = sorted(daily_bars[trading_date])
+        for start in range(0, len(bars), 4):
+            closes.append(bars[min(start + 3, len(bars) - 1)][1])
+    return closes
+
+
+def aggregate_weekly_closes(daily_rows, timezone_name, now=None):
+    exchange_timezone = ZoneInfo(timezone_name)
+    local_now = (now or datetime.now(exchange_timezone)).astimezone(exchange_timezone)
+    current_week = local_now.date().isocalendar()[:2]
+    close_time = (15, 30) if timezone_name == "Asia/Seoul" else (16, 0)
+    include_current_week = (
+        local_now.weekday() > 4
+        or (
+            local_now.weekday() == 4
+            and (local_now.hour, local_now.minute) >= close_time
+        )
+    )
+    weeks = {}
+    for row in daily_rows:
+        trading_date = row[5].astimezone(exchange_timezone).date()
+        week = trading_date.isocalendar()[:2]
+        if week < current_week or (include_current_week and week == current_week):
+            weeks[week] = row[0]
+    return [weeks[week] for week in sorted(weeks)]
+
+
+def get_rsi_divergences(ticker, daily_rows):
+    daily_closes = [row[0] for row in daily_rows]
+    results = {
+        "1일봉": detect_rsi_divergence(
+            daily_closes, calculate_rsi_series(daily_closes)
+        ),
+        "1주봉": "데이터 부족",
+    }
+
+    exchange_timezone = "Asia/Seoul" if ticker.endswith(".KS") else "America/New_York"
+    try:
+        hourly_bars, exchange_timezone = get_hourly_closes(ticker)
+        four_hour_closes = aggregate_four_hour_closes(
+            hourly_bars, exchange_timezone
+        )
+        results["4시간봉"] = detect_rsi_divergence(
+            four_hour_closes, calculate_rsi_series(four_hour_closes)
+        )
+    except RuntimeError as exc:
+        print(f"{ticker} 4시간봉 RSI 다이버전스 조회 실패: {exc}", file=sys.stderr)
+        results["4시간봉"] = "조회 실패"
+
+    weekly_closes = aggregate_weekly_closes(daily_rows, exchange_timezone)
+    results["1주봉"] = detect_rsi_divergence(
+        weekly_closes, calculate_rsi_series(weekly_closes)
+    )
+    return results
+
+
+def format_rsi_divergences(divergences):
+    labels = {
+        "상승 다이버전스": "🟢 상승 다이버전스",
+        "하락 다이버전스": "🔴 하락 다이버전스",
+        "감지 없음": "— 감지 없음",
+        "조회 실패": "⚠️ 조회 실패",
+        "데이터 부족": "⚪ 데이터 부족",
+    }
+    has_divergence = any(
+        value in ("상승 다이버전스", "하락 다이버전스")
+        for value in divergences.values()
+    )
+    has_failure = any(value == "조회 실패" for value in divergences.values())
+    has_insufficient_data = any(value == "데이터 부족" for value in divergences.values())
+    heading = (
+        "🚨 RSI 다이버전스 감지 🚨" if has_divergence
+        else "⚠️ 일부 봉 데이터 미확인" if has_failure
+        else "⚪ 일부 봉 데이터 부족" if has_insufficient_data
+        else "RSI 다이버전스 감지 없음"
+    )
+    details = [
+        f"{timeframe}: {labels.get(value, value)}"
+        for timeframe, value in (
+            ("4시간봉", divergences.get("4시간봉", "데이터 부족")),
+            ("1일봉", divergences.get("1일봉", "데이터 부족")),
+            ("1주봉", divergences.get("1주봉", "데이터 부족")),
+        )
+    ]
+    return "\n".join(
+        [
+            "RSI(14) 다이버전스 (각 봉 종가 기준; 4시간봉은 1시간봉 집계)",
+            heading,
+            *details,
+        ]
+    )
+
+
 def get_korea_investor_flow(ticker, now=None):
     try:
         from pykrx import stock as krx_stock
@@ -746,6 +977,16 @@ def make_report(chart_dir, market="all"):
         )
         lines.extend(["", f"━━ {stock['name']} ({ticker}) ━━", "[기술적 분석]",
                       analyze(rows, currency)])
+        try:
+            divergences = get_rsi_divergences(ticker, rows)
+        except RuntimeError as exc:
+            print(f"{ticker} RSI 다이버전스 계산 실패: {exc}", file=sys.stderr)
+            divergences = {
+                "4시간봉": "조회 실패",
+                "1일봉": "조회 실패",
+                "1주봉": "조회 실패",
+            }
+        lines.extend(["[RSI 다이버전스]", format_rsi_divergences(divergences)])
         if ticker in MARKETS["korea"]["tickers"]:
             lines.append("[투자자별 수급 · KRX 거래대금 순매수]")
             try:
