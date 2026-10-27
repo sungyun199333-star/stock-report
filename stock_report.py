@@ -368,7 +368,7 @@ def calculate_rsi_series(closes, period=14):
     return values
 
 
-def detect_rsi_divergence(
+def detect_rsi_divergence_details(
     closes,
     rsi_values,
     pivot_width=2,
@@ -377,7 +377,7 @@ def detect_rsi_divergence(
     min_pivot_separation=5,
 ):
     if len(closes) < 14 + (2 * pivot_width) + min_pivot_separation + 1:
-        return "데이터 부족"
+        return "데이터 부족", None
 
     start = max(0, len(closes) - lookback)
     low_pivots = []
@@ -423,14 +423,33 @@ def detect_rsi_divergence(
     if pair:
         previous, latest = pair
         if closes[latest] < closes[previous] and rsi_values[latest] > rsi_values[previous]:
-            return "상승 다이버전스"
+            return "상승 다이버전스", pair
 
     pair = latest_pair(high_pivots)
     if pair:
         previous, latest = pair
         if closes[latest] > closes[previous] and rsi_values[latest] < rsi_values[previous]:
-            return "하락 다이버전스"
-    return "감지 없음"
+            return "하락 다이버전스", pair
+    return "감지 없음", None
+
+
+def detect_rsi_divergence(
+    closes,
+    rsi_values,
+    pivot_width=2,
+    lookback=80,
+    max_bars_since_pivot=4,
+    min_pivot_separation=5,
+):
+    status, _ = detect_rsi_divergence_details(
+        closes,
+        rsi_values,
+        pivot_width,
+        lookback,
+        max_bars_since_pivot,
+        min_pivot_separation,
+    )
+    return status
 
 
 def get_hourly_closes(ticker):
@@ -822,7 +841,7 @@ def get_news(ticker):
     ]
 
 
-def create_chart(ticker, stock, rows, currency, output_dir):
+def create_chart(ticker, stock, rows, currency, output_dir, divergences=None):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -871,12 +890,12 @@ def create_chart(ticker, stock, rows, currency, output_dir):
 
     start = max(0, count - 130)
     visible_x = x_values[start:]
-    fig, (price_ax, volume_ax) = plt.subplots(
-        2, 1, figsize=(12, 8), sharex=True,
-        gridspec_kw={"height_ratios": [3.2, 1]}, constrained_layout=True,
+    fig, (price_ax, volume_ax, rsi_ax) = plt.subplots(
+        3, 1, figsize=(12, 10), sharex=True,
+        gridspec_kw={"height_ratios": [3.2, 1, 1.2]}, constrained_layout=True,
     )
     fig.suptitle(
-        f"{ticker} - Daily Candles and Indicators | {dates[-1]:%Y-%m-%d}",
+        f"{ticker} - Daily Candles, Indicators and RSI | {dates[-1]:%Y-%m-%d}",
         fontsize=15, fontweight="bold",
     )
     for index in visible_x:
@@ -890,6 +909,86 @@ def create_chart(ticker, stock, rows, currency, output_dir):
                       edgecolor=color, linewidth=0.7)
         )
         volume_ax.bar(index, volumes[index], color=color, width=0.65, alpha=0.75)
+
+    rsi_values = calculate_rsi_series(closes)
+    daily_divergence, pivot_pair = detect_rsi_divergence_details(
+        closes, rsi_values
+    )
+    if pivot_pair:
+        first, second = pivot_pair
+        is_bullish = daily_divergence == "상승 다이버전스"
+        color = "#159a69" if is_bullish else "#df4b52"
+        divergence_label = "Bullish divergence" if is_bullish else "Bearish divergence"
+        price_ax.plot(
+            [first, second],
+            [closes[first], closes[second]],
+            color=color,
+            linewidth=1.8,
+            linestyle="--",
+            marker="o",
+            markersize=5,
+            label=f"Daily {divergence_label}",
+            zorder=5,
+        )
+        rsi_ax.plot(
+            [first, second],
+            [rsi_values[first], rsi_values[second]],
+            color=color,
+            linewidth=1.8,
+            linestyle="--",
+            marker="o",
+            markersize=5,
+            label=f"Daily {divergence_label}",
+            zorder=5,
+        )
+        rsi_ax.annotate(
+            "Bullish divergence" if is_bullish else "Bearish divergence",
+            xy=(second, rsi_values[second]),
+            xytext=(6, 8 if is_bullish else -16),
+            textcoords="offset points",
+            color=color,
+            fontsize=8,
+            fontweight="bold",
+        )
+
+    rsi_ax.plot(
+        x_values[start:], rsi_values[start:], color="#375a9e",
+        linewidth=1.2, label="RSI (14)",
+    )
+    rsi_ax.axhline(70, color="#df4b52", linewidth=0.9, linestyle="--", label="Overbought (70)")
+    rsi_ax.axhline(30, color="#159a69", linewidth=0.9, linestyle="--", label="Oversold (30)")
+    rsi_ax.axhline(50, color="#888888", linewidth=0.7, linestyle=":", alpha=0.8)
+    rsi_ax.fill_between(x_values[start:], 30, 70, color="#b5c8e8", alpha=0.14)
+    rsi_ax.set_ylim(0, 100)
+    rsi_ax.set_ylabel("RSI (14)")
+    rsi_ax.legend(loc="upper left", ncol=3, fontsize=8, framealpha=0.9)
+    if divergences:
+        divergence_labels = {
+            "상승 다이버전스": "Bullish",
+            "하락 다이버전스": "Bearish",
+            "감지 없음": "None",
+            "조회 실패": "Failed",
+            "데이터 부족": "N/A",
+        }
+        timeframe_summary = "Divergence  " + " | ".join(
+            f"{timeframe}: {divergence_labels.get(status, status)}"
+            for timeframe, status in (
+                ("4h", divergences.get("4시간봉", "데이터 부족")),
+                ("1D", divergences.get("1일봉", "데이터 부족")),
+                ("1W", divergences.get("1주봉", "데이터 부족")),
+            )
+        )
+        rsi_ax.text(
+            0.99,
+            0.96,
+            timeframe_summary,
+            transform=rsi_ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.85},
+        )
+    rsi_ax.grid(True, alpha=0.2)
 
     ma_colors = {5: "#1f77b4", 20: "#ff9f1c", 50: "#8a5bb7",
                  120: "#555555", 200: "#a15c38"}
@@ -939,14 +1038,14 @@ def create_chart(ticker, stock, rows, currency, output_dir):
     volume_ax.yaxis.set_major_formatter(
         FuncFormatter(lambda value, _position: f"{value / 1_000_000:.1f}M")
     )
-    volume_ax.set_xlabel("Date")
+    rsi_ax.set_xlabel("Date")
     price_ax.grid(True, alpha=0.2)
     volume_ax.grid(True, axis="y", alpha=0.2)
     price_ax.legend(loc="upper left", ncol=3, fontsize=8, framealpha=0.9)
     tick_positions = list(range(start, count, max(1, (count - start) // 6)))
     price_ax.set_xlim(start - 1, count)
-    volume_ax.set_xticks(tick_positions)
-    volume_ax.set_xticklabels(
+    rsi_ax.set_xticks(tick_positions)
+    rsi_ax.set_xticklabels(
         [dates[index].strftime("%b %d") for index in tick_positions],
         rotation=0,
     )
@@ -972,11 +1071,6 @@ def make_report(chart_dir, market="all"):
     for ticker in tickers:
         stock = STOCKS[ticker]
         rows, currency = get_prices(ticker)
-        charts.append(
-            (ticker, stock["name"], create_chart(ticker, stock, rows, currency, chart_dir))
-        )
-        lines.extend(["", f"━━ {stock['name']} ({ticker}) ━━", "[기술적 분석]",
-                      analyze(rows, currency)])
         try:
             divergences = get_rsi_divergences(ticker, rows)
         except RuntimeError as exc:
@@ -986,6 +1080,22 @@ def make_report(chart_dir, market="all"):
                 "1일봉": "조회 실패",
                 "1주봉": "조회 실패",
             }
+        charts.append(
+            (
+                ticker,
+                stock["name"],
+                create_chart(
+                    ticker,
+                    stock,
+                    rows,
+                    currency,
+                    chart_dir,
+                    divergences,
+                ),
+            )
+        )
+        lines.extend(["", f"━━ {stock['name']} ({ticker}) ━━", "[기술적 분석]",
+                      analyze(rows, currency)])
         lines.extend(["[RSI 다이버전스]", format_rsi_divergences(divergences)])
         if ticker in MARKETS["korea"]["tickers"]:
             lines.append("[투자자별 수급 · KRX 거래대금 순매수]")
@@ -1098,7 +1208,7 @@ def send_chart(ticker, name, image_path):
     boundary = "----StockReportBoundary7MA4YWxkTrZu0gW"
     fields = {
         "chat_id": chat_id,
-        "caption": f"{name} ({ticker}) 일봉 차트 | 캔들·이평선·볼린저 밴드·일목 구름대",
+        "caption": f"{name} ({ticker}) 일봉 차트 | 캔들·이평선·볼린저 밴드·일목·RSI(14)",
     }
     body = bytearray()
     for key, value in fields.items():

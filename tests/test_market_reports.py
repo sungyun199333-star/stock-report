@@ -10,6 +10,7 @@ from stock_report import (
     analyze,
     calculate_rsi_series,
     detect_rsi_divergence,
+    detect_rsi_divergence_details,
     format_rsi_divergences,
     make_report,
     should_run_us_schedule,
@@ -46,6 +47,10 @@ class MarketReportTests(unittest.TestCase):
         self.assertEqual(
             detect_rsi_divergence(closes_for_bullish, bullish_rsi),
             "상승 다이버전스",
+        )
+        self.assertEqual(
+            detect_rsi_divergence_details(closes_for_bullish, bullish_rsi),
+            ("상승 다이버전스", (10, 25)),
         )
         self.assertEqual(
             detect_rsi_divergence(closes_for_bearish, bearish_rsi),
@@ -140,7 +145,10 @@ class MarketReportTests(unittest.TestCase):
             with (
                 patch("stock_report.get_macro_summary", return_value="macro"),
                 patch("stock_report.get_prices", return_value=(sample_rows, "USD")),
-                patch("stock_report.create_chart", side_effect=lambda ticker, *_: f"{ticker}.png"),
+                patch(
+                    "stock_report.create_chart",
+                    side_effect=lambda ticker, *args: f"{ticker}.png",
+                ) as create_chart,
                 patch(
                     "stock_report.get_rsi_divergences",
                     return_value={
@@ -174,6 +182,13 @@ class MarketReportTests(unittest.TestCase):
         self.assertIn("Meta Platforms (META)", us_report)
         self.assertIn("iShares Semiconductor ETF (SOXX)", us_report)
         self.assertIn("🚨 RSI 다이버전스 감지 🚨", korea_report)
+        chart_divergences = [
+            call.args[5] for call in create_chart.call_args_list
+        ]
+        self.assertEqual(
+            [divergence["4시간봉"] for divergence in chart_divergences],
+            ["상승 다이버전스"] * 2 + ["상승 다이버전스"] * 4,
+        )
         self.assertNotIn("SK하이닉스 (000660.KS)", us_report)
         self.assertNotIn("NAVER (035420.KS)", us_report)
         self.assertEqual(
