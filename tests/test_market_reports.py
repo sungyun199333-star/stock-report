@@ -12,7 +12,9 @@ from stock_report import (
     detect_rsi_divergence,
     detect_rsi_divergence_details,
     format_rsi_divergences,
+    get_rsi_divergences,
     make_report,
+    RsiDivergenceReport,
     should_run_us_schedule,
 )
 
@@ -101,6 +103,54 @@ class MarketReportTests(unittest.TestCase):
 
         self.assertEqual(before_close, [])
         self.assertEqual(after_close, [101.0])
+
+    def test_divergence_report_keeps_daily_rsi_and_adds_only_divergent_frames(self):
+        market_tz = ZoneInfo("America/New_York")
+        daily_rows = [
+            (
+                100.0 + index,
+                1000,
+                101.0 + index,
+                99.0 + index,
+                99.5 + index,
+                datetime(2026, 6, 1, 16, tzinfo=market_tz)
+                + timedelta(days=index),
+            )
+            for index in range(140)
+        ]
+        hourly_bars = [
+            (
+                datetime(2026, 6, 1, 9, 30, tzinfo=market_tz)
+                + timedelta(days=day)
+                + timedelta(hours=hour),
+                float(day * 4 + hour + 1),
+            )
+            for day in range(140)
+            for hour in range(4)
+        ]
+        with (
+            patch(
+                "stock_report.get_hourly_closes",
+                return_value=(hourly_bars, "America/New_York"),
+            ),
+            patch(
+                "stock_report.detect_rsi_divergence_details",
+                side_effect=[
+                    ("감지 없음", None),
+                    ("상승 다이버전스", (16, 25)),
+                    ("하락 다이버전스", (5, 15)),
+                ],
+            ),
+        ):
+            result = get_rsi_divergences("TSLA", daily_rows)
+
+        self.assertIsInstance(result, RsiDivergenceReport)
+        self.assertEqual(result.statuses["1일봉"], "감지 없음")
+        self.assertEqual(result.statuses["4시간봉"], "상승 다이버전스")
+        self.assertEqual(result.statuses["1주봉"], "하락 다이버전스")
+        self.assertEqual(set(result.chart_series), {"1일봉", "4시간봉", "1주봉"})
+        self.assertEqual(result.chart_series["4시간봉"]["pivots"][0][1], 100.0)
+        self.assertEqual(result.chart_series["4시간봉"]["pivots"][1][1], 100.0)
 
     def test_formats_divergence_with_emphasis_and_timeframe_labels(self):
         message = format_rsi_divergences(

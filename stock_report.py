@@ -16,11 +16,20 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
 SEOUL = ZoneInfo("Asia/Seoul")
+
+
+@dataclass
+class RsiDivergenceReport:
+    statuses: dict
+    chart_series: dict
+
+
 STOCKS = {
     "000660.KS": {"name": "SK하이닉스", "query": "SK하이닉스 OR SK hynix"},
     "035420.KS": {"name": "NAVER", "query": "NAVER OR 네이버"},
@@ -493,6 +502,13 @@ def get_hourly_closes(ticker):
 
 
 def aggregate_four_hour_closes(hourly_bars, timezone_name):
+    return [
+        close
+        for _, close in aggregate_four_hour_bars(hourly_bars, timezone_name)
+    ]
+
+
+def aggregate_four_hour_bars(hourly_bars, timezone_name):
     exchange_timezone = ZoneInfo(timezone_name)
     daily_bars = {}
     for timestamp, close in hourly_bars:
@@ -505,11 +521,11 @@ def aggregate_four_hour_closes(hourly_bars, timezone_name):
     for trading_date in sorted(daily_bars):
         bars = sorted(daily_bars[trading_date])
         for start in range(0, len(bars), 4):
-            closes.append(bars[min(start + 3, len(bars) - 1)][1])
+            closes.append(bars[min(start + 3, len(bars) - 1)])
     return closes
 
 
-def aggregate_weekly_closes(daily_rows, timezone_name, now=None):
+def aggregate_weekly_points(daily_rows, timezone_name, now=None):
     exchange_timezone = ZoneInfo(timezone_name)
     local_now = (now or datetime.now(exchange_timezone)).astimezone(exchange_timezone)
     current_week = local_now.date().isocalendar()[:2]
@@ -522,44 +538,107 @@ def aggregate_weekly_closes(daily_rows, timezone_name, now=None):
         )
     )
     weeks = {}
-    for row in daily_rows:
+    for index, row in enumerate(daily_rows):
         trading_date = row[5].astimezone(exchange_timezone).date()
         week = trading_date.isocalendar()[:2]
         if week < current_week or (include_current_week and week == current_week):
-            weeks[week] = row[0]
+            weeks[week] = (index, row[0])
     return [weeks[week] for week in sorted(weeks)]
+
+
+def aggregate_weekly_closes(daily_rows, timezone_name, now=None):
+    return [
+        close
+        for _, close in aggregate_weekly_points(daily_rows, timezone_name, now)
+    ]
+
+
+def _divergence_chart_series(closes, x_values):
+    rsi_values = calculate_rsi_series(closes)
+    status, pivot_pair = detect_rsi_divergence_details(closes, rsi_values)
+    points = [
+        (x_value, rsi_value)
+        for x_value, rsi_value in zip(x_values, rsi_values)
+        if rsi_value is not None
+    ]
+    pivots = None
+    if pivot_pair:
+        pivots = [
+            (x_values[index], rsi_values[index])
+            for index in pivot_pair
+        ]
+    return status, {"points": points, "pivots": pivots}
+
+
+def _intraday_x_position(timestamp, daily_index, timezone_name):
+    exchange_timezone = ZoneInfo(timezone_name)
+    local_timestamp = timestamp.astimezone(exchange_timezone)
+    if timezone_name == "Asia/Seoul":
+        market_open, market_close = 9 * 60, 15 * 60 + 30
+    else:
+        market_open, market_close = 9 * 60 + 30, 16 * 60
+    elapsed = local_timestamp.hour * 60 + local_timestamp.minute - market_open
+    fraction = min(1.0, max(0.0, elapsed / (market_close - market_open)))
+    return daily_index - 1 + fraction
 
 
 def get_rsi_divergences(ticker, daily_rows):
     daily_closes = [row[0] for row in daily_rows]
-    results = {
-        "1일봉": detect_rsi_divergence(
-            daily_closes, calculate_rsi_series(daily_closes)
-        ),
-        "1주봉": "데이터 부족",
-    }
+    daily_status, daily_series = _divergence_chart_series(
+        daily_closes, list(range(len(daily_closes)))
+    )
+    statuses = {"1일봉": daily_status, "1주봉": "데이터 부족"}
+    chart_series = {"1일봉": daily_series}
 
     exchange_timezone = "Asia/Seoul" if ticker.endswith(".KS") else "America/New_York"
     try:
         hourly_bars, exchange_timezone = get_hourly_closes(ticker)
-        four_hour_closes = aggregate_four_hour_closes(
+        four_hour_bars = aggregate_four_hour_bars(
             hourly_bars, exchange_timezone
         )
-        results["4시간봉"] = detect_rsi_divergence(
-            four_hour_closes, calculate_rsi_series(four_hour_closes)
+        daily_indices = {
+            row[5].astimezone(ZoneInfo(exchange_timezone)).date(): index
+            for index, row in enumerate(daily_rows)
+        }
+        valid_four_hour_bars = [
+            (timestamp, close)
+            for timestamp, close in four_hour_bars
+            if timestamp.astimezone(ZoneInfo(exchange_timezone)).date() in daily_indices
+        ]
+        four_hour_closes = [close for _, close in valid_four_hour_bars]
+        four_hour_x = [
+            _intraday_x_position(
+                timestamp,
+                daily_indices[timestamp.astimezone(ZoneInfo(exchange_timezone)).date()],
+                exchange_timezone,
+            )
+            for timestamp, _ in valid_four_hour_bars
+        ]
+        four_hour_status, four_hour_series = _divergence_chart_series(
+            four_hour_closes, four_hour_x
         )
+        statuses["4시간봉"] = four_hour_status
+        if four_hour_status in ("상승 다이버전스", "하락 다이버전스"):
+            chart_series["4시간봉"] = four_hour_series
     except RuntimeError as exc:
         print(f"{ticker} 4시간봉 RSI 다이버전스 조회 실패: {exc}", file=sys.stderr)
-        results["4시간봉"] = "조회 실패"
+        statuses["4시간봉"] = "조회 실패"
 
-    weekly_closes = aggregate_weekly_closes(daily_rows, exchange_timezone)
-    results["1주봉"] = detect_rsi_divergence(
-        weekly_closes, calculate_rsi_series(weekly_closes)
+    weekly_points = aggregate_weekly_points(daily_rows, exchange_timezone)
+    weekly_x = [index for index, _ in weekly_points]
+    weekly_closes = [close for _, close in weekly_points]
+    weekly_status, weekly_series = _divergence_chart_series(
+        weekly_closes, weekly_x
     )
-    return results
+    statuses["1주봉"] = weekly_status
+    if weekly_status in ("상승 다이버전스", "하락 다이버전스"):
+        chart_series["1주봉"] = weekly_series
+    return RsiDivergenceReport(statuses, chart_series)
 
 
 def format_rsi_divergences(divergences):
+    if isinstance(divergences, RsiDivergenceReport):
+        divergences = divergences.statuses
     labels = {
         "상승 다이버전스": "🟢 상승 다이버전스",
         "하락 다이버전스": "🔴 하락 다이버전스",
@@ -910,40 +989,91 @@ def create_chart(ticker, stock, rows, currency, output_dir, divergences=None):
         )
         volume_ax.bar(index, volumes[index], color=color, width=0.65, alpha=0.75)
 
-    rsi_values = calculate_rsi_series(closes)
-    daily_divergence, pivot_pair = detect_rsi_divergence_details(
-        closes, rsi_values
-    )
-    if pivot_pair:
-        first, second = pivot_pair
-        is_bullish = daily_divergence == "상승 다이버전스"
+    daily_rsi_values = calculate_rsi_series(closes)
+    if isinstance(divergences, RsiDivergenceReport):
+        chart_series = divergences.chart_series
+        divergence_statuses = divergences.statuses
+    else:
+        daily_status, daily_pivots = detect_rsi_divergence_details(
+            closes, daily_rsi_values
+        )
+        chart_series = {
+            "1일봉": {
+                "points": [
+                    (index, value)
+                    for index, value in enumerate(daily_rsi_values)
+                    if value is not None
+                ],
+                "pivots": (
+                    [
+                        (index, daily_rsi_values[index])
+                        for index in daily_pivots
+                    ]
+                    if daily_pivots else None
+                ),
+            }
+        }
+        divergence_statuses = (
+            divergences if isinstance(divergences, dict) else {"1일봉": daily_status}
+        )
+
+    chart_styles = {
+        "1일봉": {"color": "#375a9e", "label": "1D RSI (14)"},
+        "4시간봉": {"color": "#d48806", "label": "4H RSI (14)"},
+        "1주봉": {"color": "#845ec2", "label": "1W RSI (14)"},
+    }
+    for timeframe in ("1일봉", "4시간봉", "1주봉"):
+        series = chart_series.get(timeframe)
+        if not series:
+            continue
+        style = chart_styles[timeframe]
+        visible_points = [
+            (x_value, rsi_value)
+            for x_value, rsi_value in series["points"]
+            if start - 1 <= x_value <= count
+        ]
+        if visible_points:
+            rsi_ax.plot(
+                [point[0] for point in visible_points],
+                [point[1] for point in visible_points],
+                color=style["color"],
+                linewidth=1.2,
+                label=style["label"],
+            )
+        pivots = series.get("pivots")
+        if not pivots:
+            continue
+        status = divergence_statuses.get(timeframe, "감지 없음")
+        is_bullish = status == "상승 다이버전스"
         color = "#159a69" if is_bullish else "#df4b52"
-        divergence_label = "Bullish divergence" if is_bullish else "Bearish divergence"
-        price_ax.plot(
-            [first, second],
-            [closes[first], closes[second]],
-            color=color,
-            linewidth=1.8,
-            linestyle="--",
-            marker="o",
-            markersize=5,
-            label=f"Daily {divergence_label}",
-            zorder=5,
-        )
+        pivot_x = [point[0] for point in pivots]
+        pivot_rsi = [point[1] for point in pivots]
         rsi_ax.plot(
-            [first, second],
-            [rsi_values[first], rsi_values[second]],
+            pivot_x,
+            pivot_rsi,
             color=color,
             linewidth=1.8,
             linestyle="--",
             marker="o",
             markersize=5,
-            label=f"Daily {divergence_label}",
+            label=f"{timeframe} {'Bullish' if is_bullish else 'Bearish'} divergence",
             zorder=5,
         )
+        if timeframe == "1일봉":
+            price_ax.plot(
+                pivot_x,
+                [closes[round(index)] for index in pivot_x],
+                color=color,
+                linewidth=1.8,
+                linestyle="--",
+                marker="o",
+                markersize=5,
+                label=f"Daily {'Bullish' if is_bullish else 'Bearish'} divergence",
+                zorder=5,
+            )
         rsi_ax.annotate(
-            "Bullish divergence" if is_bullish else "Bearish divergence",
-            xy=(second, rsi_values[second]),
+            f"{timeframe} {'Bullish' if is_bullish else 'Bearish'}",
+            xy=(pivot_x[-1], pivot_rsi[-1]),
             xytext=(6, 8 if is_bullish else -16),
             textcoords="offset points",
             color=color,
@@ -951,10 +1081,6 @@ def create_chart(ticker, stock, rows, currency, output_dir, divergences=None):
             fontweight="bold",
         )
 
-    rsi_ax.plot(
-        x_values[start:], rsi_values[start:], color="#375a9e",
-        linewidth=1.2, label="RSI (14)",
-    )
     rsi_ax.axhline(70, color="#df4b52", linewidth=0.9, linestyle="--", label="Overbought (70)")
     rsi_ax.axhline(30, color="#159a69", linewidth=0.9, linestyle="--", label="Oversold (30)")
     rsi_ax.axhline(50, color="#888888", linewidth=0.7, linestyle=":", alpha=0.8)
@@ -973,9 +1099,9 @@ def create_chart(ticker, stock, rows, currency, output_dir, divergences=None):
         timeframe_summary = "Divergence  " + " | ".join(
             f"{timeframe}: {divergence_labels.get(status, status)}"
             for timeframe, status in (
-                ("4h", divergences.get("4시간봉", "데이터 부족")),
-                ("1D", divergences.get("1일봉", "데이터 부족")),
-                ("1W", divergences.get("1주봉", "데이터 부족")),
+                ("4h", divergence_statuses.get("4시간봉", "데이터 부족")),
+                ("1D", divergence_statuses.get("1일봉", "데이터 부족")),
+                ("1W", divergence_statuses.get("1주봉", "데이터 부족")),
             )
         )
         rsi_ax.text(
