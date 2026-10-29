@@ -92,8 +92,11 @@ def translate_to_korean(text):
     return translated
 
 
-def fetch(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "DailyStockReport/1.0"})
+def fetch(url, headers=None):
+    request_headers = {"User-Agent": "DailyStockReport/1.0"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers)
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             return response.read()
@@ -131,7 +134,21 @@ def fetch_cnn_fear_greed_index(now=None):
         f"{start_date.isoformat()}"
     )
     try:
-        payload = json.loads(fetch(url))
+        payload = json.loads(
+            fetch(
+                url,
+                {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "application/json, text/plain, */*",
+                    "Origin": "https://www.cnn.com",
+                    "Referer": "https://www.cnn.com/markets/fear-and-greed",
+                },
+            )
+        )
         current = payload["fear_and_greed"]
         score = float(current["score"])
     except (RuntimeError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:

@@ -83,11 +83,19 @@ class MacroSummaryTests(unittest.TestCase):
             b'{"fear_and_greed":{"score":72.4,"rating":"greed",'
             b'"timestamp":"2026-10-16T16:00:00-04:00"}}'
         )
-        with patch("stock_report.fetch", return_value=payload):
+        with patch("stock_report.fetch", return_value=payload) as fetch:
             result = fetch_cnn_fear_greed_index(
                 datetime(2026, 10, 19, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
             )
 
+        request_url, request_headers = fetch.call_args.args
+        self.assertIn("fearandgreed/graphdata/2026-10-05", request_url)
+        self.assertEqual(request_headers["Origin"], "https://www.cnn.com")
+        self.assertEqual(
+            request_headers["Referer"],
+            "https://www.cnn.com/markets/fear-and-greed",
+        )
+        self.assertIn("Mozilla/5.0", request_headers["User-Agent"])
         self.assertEqual(result["score"], 72.4)
         self.assertEqual(result["observed_at"].date(), date(2026, 10, 17))
         self.assertEqual(fear_greed_label(result["score"]), "탐욕")
