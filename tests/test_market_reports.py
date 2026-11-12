@@ -12,6 +12,7 @@ from stock_report import (
     calculate_rsi_series,
     detect_rsi_divergence,
     detect_rsi_divergence_details,
+    find_rsi_divergence_events,
     format_rsi_divergences,
     format_option_interest_levels,
     get_option_interest_levels,
@@ -118,6 +119,29 @@ class MarketReportTests(unittest.TestCase):
                 bullish_rsi + [50.0] * 5,
             ),
             "감지 없음",
+        )
+
+    def test_finds_all_historical_rsi_divergence_events(self):
+        closes = [100.0] * 40
+        rsi_values = [50.0] * 40
+        for index, price, rsi in (
+            (10, 90.0, 30.0),
+            (20, 85.0, 40.0),
+            (30, 80.0, 50.0),
+        ):
+            closes[index] = price
+            rsi_values[index] = rsi
+
+        self.assertEqual(
+            find_rsi_divergence_events(closes, rsi_values),
+            [
+                ("상승 다이버전스", (10, 20)),
+                ("상승 다이버전스", (20, 30)),
+            ],
+        )
+        self.assertEqual(
+            detect_rsi_divergence_details(closes, rsi_values),
+            ("감지 없음", None),
         )
 
     def test_aggregates_hourly_closes_into_session_four_hour_bars(self):
@@ -294,6 +318,12 @@ class MarketReportTests(unittest.TestCase):
         self.assertIn("Meta Platforms (META)", us_report)
         self.assertIn("iShares Semiconductor ETF (SOXX)", us_report)
         self.assertIn("🚨 RSI 다이버전스 감지 🚨", korea_report)
+        korea_lines = korea_report.splitlines()
+        korea_summary_index = korea_lines.index("[종목별 요약 · 기술적 지표]")
+        self.assertGreater(korea_summary_index, korea_lines.index("macro"))
+        self.assertLess(korea_summary_index, korea_lines.index("━━ SK하이닉스 (000660.KS) ━━"))
+        self.assertIn("SK하이닉스 (000660.KS): 100.00 USD (+0.00%)", korea_report)
+        self.assertIn("상승 0/6 | 🔴 하락·과열 1/6", korea_report)
         chart_divergences = [
             call.args[5] for call in create_chart.call_args_list
         ]
