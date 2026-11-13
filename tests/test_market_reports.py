@@ -314,7 +314,7 @@ class MarketReportTests(unittest.TestCase):
             [chart[0] for chart in korea_charts], ["000660.KS", "035420.KS"]
         )
         self.assertIn("Tesla (TSLA)", us_report)
-        self.assertIn("SPAC and New Issue ETF (SPCX)", us_report)
+        self.assertIn("SpaceX (SPCX)", us_report)
         self.assertIn("Meta Platforms (META)", us_report)
         self.assertIn("iShares Semiconductor ETF (SOXX)", us_report)
         self.assertIn("🚨 RSI 다이버전스 감지 🚨", korea_report)

@@ -34,7 +34,10 @@ STOCKS = {
     "000660.KS": {"name": "SK하이닉스", "query": "SK하이닉스 OR SK hynix"},
     "035420.KS": {"name": "NAVER", "query": "NAVER OR 네이버"},
     "TSLA": {"name": "Tesla", "query": "Tesla OR TSLA"},
-    "SPCX": {"name": "SPAC and New Issue ETF", "query": '"SPAC and New Issue ETF" OR SPCX'},
+    "SPCX": {
+        "name": "SpaceX",
+        "query": '"Space Exploration Technologies" OR SpaceX OR SPCX',
+    },
     "META": {"name": "Meta Platforms", "query": "Meta Platforms OR META"},
     "SOXX": {"name": "iShares Semiconductor ETF", "query": '"iShares Semiconductor ETF" OR SOXX'},
 }

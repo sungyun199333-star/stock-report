@@ -9,17 +9,17 @@ from asset_report import get_latest_price, make_report, parse_holdings
 class HoldingsTests(unittest.TestCase):
     def test_parses_holdings_without_rounding_quantities(self):
         holdings = parse_holdings(
-            '[{"ticker":"000660.KS","name":"example","quantity":103},'
-            '{"ticker":"035420.KS","name":"another","quantity":2.5}]'
+            '[{"ticker":"TEST1.KS","name":"example","quantity":7},'
+            '{"ticker":"TEST2.KQ","name":"another","quantity":2.5}]'
         )
 
-        self.assertEqual(holdings[0]["quantity"], Decimal("103"))
+        self.assertEqual(holdings[0]["quantity"], Decimal("7"))
         self.assertEqual(holdings[1]["quantity"], Decimal("2.5"))
 
     def test_rejects_duplicate_tickers(self):
         raw = (
-            '[{"ticker":"000660.KS","name":"one","quantity":1},'
-            '{"ticker":"000660.KS","name":"duplicate","quantity":2}]'
+            '[{"ticker":"TEST1.KS","name":"one","quantity":1},'
+            '{"ticker":"TEST1.KS","name":"duplicate","quantity":2}]'
         )
         with self.assertRaisesRegex(ValueError, "중복"):
             parse_holdings(raw)
@@ -28,7 +28,7 @@ class HoldingsTests(unittest.TestCase):
         for quantity in ("0", "-1", "NaN", "not-a-number"):
             with self.subTest(quantity=quantity):
                 raw = (
-                    '[{"ticker":"000660.KS","name":"example",'
+                    '[{"ticker":"TEST1.KS","name":"example",'
                     f'"quantity":"{quantity}"' + "}]"
                 )
                 with self.assertRaises(ValueError):
@@ -36,18 +36,18 @@ class HoldingsTests(unittest.TestCase):
 
     def test_formats_each_position_and_krw_total(self):
         holdings = parse_holdings(
-            '[{"ticker":"000660.KS","name":"example","quantity":2},'
-            '{"ticker":"035420.KS","name":"another","quantity":3}]'
+            '[{"ticker":"TEST1.KS","name":"example","quantity":2},'
+            '{"ticker":"TEST2.KQ","name":"another","quantity":3}]'
         )
         report = make_report(
             holdings,
             {
-                "000660.KS": (
+                "TEST1.KS": (
                     Decimal("1000"),
                     datetime(2026, 11, 12, 6, 0, tzinfo=timezone.utc),
                     "KRW",
                 ),
-                "035420.KS": (
+                "TEST2.KQ": (
                     Decimal("2"),
                     datetime(2026, 11, 12, 7, 0, tzinfo=timezone.utc),
                     "USD",
