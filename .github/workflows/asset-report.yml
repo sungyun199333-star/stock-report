@@ -2,7 +2,9 @@ name: Daily asset Telegram report
 
 on:
   schedule:
-    - cron: "0 21 * * *"
+    - cron: "30 6 * * 1-5"
+    - cron: "0 20 * * 1-5"
+    - cron: "0 21 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -18,9 +20,22 @@ jobs:
           python-version: "3.12"
       - name: Install report dependencies
         run: pip install -r requirements.txt
+      - name: Match U.S. close schedule to Eastern Time
+        id: us-close
+        if: >-
+          github.event_name == 'schedule' &&
+          (github.event.schedule == '0 20 * * 1-5' ||
+          github.event.schedule == '0 21 * * 1-5')
+        run: |
+          python -c 'from asset_report import is_us_market_close; print("send=" + str(is_us_market_close()).lower())' >> "$GITHUB_OUTPUT"
       - name: Send daily asset report
+        if: >-
+          github.event_name != 'schedule' ||
+          github.event.schedule == '30 6 * * 1-5' ||
+          steps.us-close.outputs.send == 'true'
         env:
           ASSET_HOLDINGS_JSON: ${{ secrets.ASSET_HOLDINGS_JSON }}
+          ASSET_REPORT_SESSION: ${{ github.event.schedule || '수동 실행' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python asset_report.py

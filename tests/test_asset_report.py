@@ -1,8 +1,15 @@
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
-from asset_report import get_latest_price, make_report, parse_holdings
+from asset_report import (
+    REPORT_SESSIONS,
+    get_latest_price,
+    is_us_market_close,
+    make_report,
+    parse_holdings,
+)
 
 
 class HoldingsTests(unittest.TestCase):
@@ -72,6 +79,22 @@ class HoldingsTests(unittest.TestCase):
 
         self.assertEqual(price, Decimal("123.45"))
         self.assertEqual(currency, "USD")
+
+    def test_identifies_korea_and_us_market_close_triggers(self):
+        self.assertEqual(REPORT_SESSIONS["30 6 * * 1-5"], "한국장 마감")
+        self.assertEqual(REPORT_SESSIONS["0 20 * * 1-5"], "미국장 마감")
+        self.assertEqual(REPORT_SESSIONS["0 21 * * 1-5"], "미국장 마감")
+
+    def test_us_close_schedule_handles_daylight_saving_time(self):
+        summer_close = datetime(2026, 7, 13, 20, 0, tzinfo=timezone.utc)
+        winter_close = datetime(2026, 1, 13, 21, 0, tzinfo=timezone.utc)
+        summer_wrong_cron = datetime(2026, 7, 13, 21, 0, tzinfo=timezone.utc)
+        winter_wrong_cron = datetime(2026, 1, 13, 20, 0, tzinfo=timezone.utc)
+
+        self.assertTrue(is_us_market_close(summer_close))
+        self.assertTrue(is_us_market_close(winter_close))
+        self.assertFalse(is_us_market_close(summer_wrong_cron))
+        self.assertFalse(is_us_market_close(winter_wrong_cron))
 
 
 if __name__ == "__main__":

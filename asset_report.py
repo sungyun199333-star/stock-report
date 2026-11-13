@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -14,6 +14,12 @@ from stock_report import fetch, send_telegram
 
 SEOUL = ZoneInfo("Asia/Seoul")
 TICKER_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
+REPORT_SESSIONS = {
+    "30 6 * * 1-5": "한국장 마감",
+    "0 20 * * 1-5": "미국장 마감",
+    "0 21 * * 1-5": "미국장 마감",
+}
+US_EASTERN = ZoneInfo("America/New_York")
 
 
 def parse_holdings(raw):
@@ -46,6 +52,11 @@ def parse_holdings(raw):
         parsed.append({"ticker": ticker, "name": name, "quantity": quantity})
         seen_tickers.add(ticker)
     return parsed
+
+
+def is_us_market_close(now_utc=None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    return now_utc.astimezone(US_EASTERN).strftime("%H:%M") == "16:00"
 
 
 def get_latest_price(ticker):
@@ -85,7 +96,7 @@ def get_latest_price(ticker):
     return Decimal(str(price)), currency
 
 
-def make_report(holdings, quotes, usd_krw=None):
+def make_report(holdings, quotes, usd_krw=None, session_label=""):
     groups = {"KRW": [], "USD": []}
     for holding in holdings:
         ticker = holding["ticker"]
@@ -107,8 +118,11 @@ def make_report(holdings, quotes, usd_krw=None):
         Decimal(0),
     )
     report_date = datetime.now(SEOUL).strftime("%Y-%m-%d")
+    title = f"📊 자산 평가 리포트 · {report_date}"
+    if session_label:
+        title += f" · {session_label}"
     lines = [
-        f"📊 자산 평가 리포트 · {report_date}",
+        title,
         "",
         "💰 총 보유자산",
         f"₩{total:,.0f}",
@@ -158,7 +172,9 @@ def main():
         )
         if usd_krw is not None and usd_krw[1] != "KRW":
             raise RuntimeError("USD/KRW 환율 시세의 통화가 올바르지 않습니다.")
-        send_telegram(make_report(holdings, quotes, usd_krw))
+        schedule = os.environ.get("ASSET_REPORT_SESSION", "")
+        session_label = REPORT_SESSIONS.get(schedule, schedule or "수동 실행")
+        send_telegram(make_report(holdings, quotes, usd_krw, session_label))
     except (RuntimeError, ValueError) as exc:
         print(f"자산 리포트 실패: {exc}", file=sys.stderr)
         return 1
