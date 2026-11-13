@@ -1,54 +1,49 @@
-# Daily Google Sheets asset report
+# Daily stock valuation report
 
-The `Daily asset Telegram report` workflow reads dated valuation rows from a
-Google Sheet and sends the change between the two most recent dates to Telegram
-every day at 06:00 Korea Standard Time. It can also be run manually from the
-GitHub Actions tab.
+The `Daily asset Telegram report` workflow fetches the latest available daily
+regular-session prices for the configured holdings, converts USD-denominated
+positions to KRW using the USD/KRW rate, calculates each position's market
+value and the portfolio total, then sends the report to Telegram. It runs daily
+at 06:00 Korea Standard Time and can also be started manually in GitHub Actions.
 
-## Sheet format
+## Configure holdings privately
 
-The default tab is `Sheet1`. Its first row must contain `날짜` and `총액(원)`
-headers, for example:
+This repository is public. Do not put personal holdings or quantities in source
+files, workflow variables, or commits. Store the complete holdings JSON as the
+repository Actions secret `ASSET_HOLDINGS_JSON`.
 
-| 날짜 | 총액(원) |
-| --- | ---: |
-| 2026-10-16 | 12500000 |
-| 2026-10-17 | 12620000 |
+In the repository, open **Settings → Secrets and variables → Actions → New
+repository secret**. Set the name to `ASSET_HOLDINGS_JSON` and the value to a
+JSON array in this format:
 
-All amounts should use the same currency and include any desired conversion
-before they are recorded. The workflow adds all valuation rows that share the
-same date. Use either one total row per date or one row per asset per date; do
-not include both a daily total and its constituent asset rows, as that would
-double-count the total.
-Dates should be formatted as `YYYY-MM-DD`. Values may include comma grouping
-and a `원`/`₩` suffix. The report compares the latest two dates found in the
-sheet, which need not be yesterday and today.
+```json
+[
+  {"ticker": "KRX_CODE.KS", "name": "표시할 종목명", "quantity": 1}
+]
+```
 
-If the existing tab or headers have different names, set the corresponding
-repository Actions variables: `ASSET_SHEET_NAME`, `ASSET_DATE_COLUMN`,
-`ASSET_VALUE_COLUMN`, and optionally `ASSET_CURRENCY`.
+Use Yahoo Finance ticker symbols, including `.KS` for KOSPI and `.KQ` for
+KOSDAQ listings. U.S. stock symbols are used without a suffix. The quantity
+can be fractional. Edit this secret whenever holdings or quantities change.
 
-## Google Sheets access
-
-1. Create a Google Cloud service account and enable the Google Sheets API.
-2. Share the spreadsheet with the service account's email as a **Viewer**.
-3. Store the service account JSON key as the repository Actions secret
-   `GOOGLE_SHEETS_CREDENTIALS` (the complete JSON content).
-4. Store the spreadsheet ID from its URL as the Actions secret
-   `GOOGLE_SHEET_ID`.
-
-The integration requests read-only Sheets access. Do not put the service
-account key, spreadsheet ID, or Telegram bot token in source code.
-
-## Telegram and scheduled run
+## Required Telegram secrets
 
 Add or verify these repository Actions secrets:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
-The schedule is `0 21 * * *` in UTC, which corresponds to 06:00 the next day
-in Korea Standard Time. GitHub Actions can delay scheduled starts, and
-scheduled workflows run from the repository's default branch. To test delivery,
-use **Actions → Daily asset Telegram report → Run workflow** after adding the
-secrets and variables.
+Never put tokens or private account details in source code or commit them.
+
+## Price and valuation details
+
+The report uses the latest available regular-session quote from Yahoo Finance.
+KRW quotes are included directly; USD quotes are converted using Yahoo
+Finance's USD/KRW rate. On weekends and market holidays, the latest available
+quotes will be reported. The report shows each holding's KRW value and the
+portfolio total; commissions, taxes, and cash balances are not included.
+
+The schedule is `0 21 * * *` in UTC, or 06:00 the following day in Korea
+Standard Time. GitHub Actions may delay scheduled starts. Scheduled workflows
+run from the repository's default branch. After adding secrets, test with
+**Actions → Daily asset Telegram report → Run workflow**.

@@ -1,192 +1,150 @@
 #!/usr/bin/env python3
-"""Send a daily total-asset change report from Google Sheets to Telegram."""
+"""Send a daily KRW valuation report for configured stock holdings."""
 
 import json
 import os
+import re
 import sys
 import urllib.parse
-from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
-from stock_report import send_telegram
+from stock_report import fetch, send_telegram
 
-DATE_HEADERS = {"날짜", "일자", "기준일", "date"}
-VALUE_HEADERS = {
-    "평가액", "총평가액", "평가금액", "총액(원)", "total_value", "valuation"
-}
-SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+SEOUL = ZoneInfo("Asia/Seoul")
+TICKER_PATTERN = re.compile(r"^[A-Z0-9.^=-]+$")
 
 
-def normalize_header(value):
-    return "".join(str(value).strip().lower().split())
-
-
-def parse_date(value):
-    text = str(value).strip()
-    if not text:
-        raise ValueError("날짜 값이 비어 있습니다.")
-    iso_text = text.replace("Z", "+00:00")
+def parse_holdings(raw):
     try:
-        return datetime.fromisoformat(iso_text).date()
-    except ValueError:
-        pass
-    for date_format in (
-        "%Y. %m. %d.",
-        "%Y.%m.%d.",
-        "%Y/%m/%d",
-        "%m/%d/%Y",
-        "%Y-%m-%d",
-    ):
+        holdings = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ASSET_HOLDINGS_JSON이 올바른 JSON이 아닙니다: {exc}") from exc
+    if not isinstance(holdings, list) or not holdings:
+        raise ValueError("ASSET_HOLDINGS_JSON은 1개 이상의 보유 종목 배열이어야 합니다.")
+
+    parsed = []
+    seen_tickers = set()
+    for index, item in enumerate(holdings, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"보유 종목 {index}번은 JSON 객체여야 합니다.")
+        ticker = str(item.get("ticker", "")).strip().upper()
+        name = str(item.get("name", "")).strip()
+        if not ticker or not TICKER_PATTERN.fullmatch(ticker):
+            raise ValueError(f"보유 종목 {index}번의 ticker 형식이 올바르지 않습니다.")
+        if not name:
+            raise ValueError(f"{ticker}의 name 값이 비어 있습니다.")
+        if ticker in seen_tickers:
+            raise ValueError(f"중복된 종목 코드가 있습니다: {ticker}")
         try:
-            return datetime.strptime(text, date_format).date()
-        except ValueError:
-            continue
-    raise ValueError(f"날짜 형식을 읽을 수 없습니다: {text}")
+            quantity = Decimal(str(item.get("quantity", "")))
+        except InvalidOperation as exc:
+            raise ValueError(f"{ticker}의 보유 수량이 숫자가 아닙니다.") from exc
+        if not quantity.is_finite() or quantity <= 0:
+            raise ValueError(f"{ticker}의 보유 수량은 0보다 큰 숫자여야 합니다.")
+        parsed.append({"ticker": ticker, "name": name, "quantity": quantity})
+        seen_tickers.add(ticker)
+    return parsed
 
 
-def parse_amount(value):
-    text = str(value).strip().replace(",", "").replace("원", "").replace("₩", "")
-    text = text.replace("−", "-").replace(" ", "")
+def get_latest_price(ticker):
+    encoded_ticker = urllib.parse.quote(ticker, safe="")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_ticker}"
+        "?range=5d&interval=1d"
+    )
     try:
-        amount = Decimal(text)
-    except InvalidOperation as exc:
-        raise ValueError(f"평가액을 숫자로 읽을 수 없습니다: {value}") from exc
-    if not amount.is_finite():
-        raise ValueError(f"평가액은 유한한 숫자여야 합니다: {value}")
-    return amount
+        payload = json.loads(fetch(url))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{ticker} 시세 응답을 해석할 수 없습니다.") from exc
 
-
-def parse_history(values, date_column=None, value_column=None):
-    if not values or not values[0]:
-        raise ValueError("스프레드시트에서 헤더 행을 찾지 못했습니다.")
-
-    headers = [normalize_header(cell) for cell in values[0]]
-    date_name = normalize_header(date_column) if date_column else None
-    value_name = normalize_header(value_column) if value_column else None
-    if date_name:
-        date_index = headers.index(date_name) if date_name in headers else None
-    else:
-        date_index = next(
-            (index for index, header in enumerate(headers) if header in DATE_HEADERS),
-            None,
-        )
-    if value_name:
-        value_index = headers.index(value_name) if value_name in headers else None
-    else:
-        value_index = next(
-            (index for index, header in enumerate(headers) if header in VALUE_HEADERS),
-            None,
-        )
-    if date_index is None or value_index is None:
-        raise ValueError(
-            "날짜/평가액 열을 찾지 못했습니다. "
-            f"현재 헤더: {', '.join(str(cell) for cell in values[0])}"
-        )
-
-    totals = defaultdict(Decimal)
-    for row_number, row in enumerate(values[1:], start=2):
-        date_value = row[date_index] if date_index < len(row) else ""
-        amount_value = row[value_index] if value_index < len(row) else ""
-        if not str(date_value).strip() and not str(amount_value).strip():
-            continue
-        try:
-            if not str(date_value).strip():
-                raise ValueError("날짜 값이 비어 있습니다.")
-            if not str(amount_value).strip():
-                raise ValueError("평가액이 비어 있습니다.")
-            row_date = parse_date(date_value)
-            totals[row_date] += parse_amount(amount_value)
-        except ValueError as exc:
-            raise ValueError(f"{row_number}행 처리 실패: {exc}") from exc
-
-    if len(totals) < 2:
-        raise ValueError("전일 대비 비교를 위해 날짜가 다른 기록이 최소 2개 필요합니다.")
-    return dict(sorted(totals.items()))
-
-
-def make_report(history, currency="원"):
-    (previous_date, previous_total), (latest_date, latest_total) = list(history.items())[-2:]
-    change = latest_total - previous_total
-    change_percent = (
-        change / previous_total * Decimal(100) if previous_total else None
-    )
-    percent_text = f"{change_percent:+.2f}%" if change_percent is not None else "계산 불가"
-    return (
-        f"📊 자산 평가액 일일 리포트\n"
-        f"기준일: {latest_date.isoformat()}\n"
-        f"총 평가액: {latest_total:,.0f} {currency}\n"
-        f"변동: {previous_date.isoformat()} 대비 "
-        f"{change:+,.0f} {currency} ({percent_text})"
-    )
-
-
-def get_sheet_values():
-    credentials_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-    spreadsheet_id = os.environ.get("GOOGLE_SHEET_ID")
-    sheet_name = os.environ.get("ASSET_SHEET_NAME", "Sheet1")
-    if not credentials_json or not spreadsheet_id:
+    chart = payload.get("chart", {})
+    if chart.get("error"):
+        raise RuntimeError(f"{ticker} 시세 조회 오류: {chart['error']}")
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError(f"{ticker} 시세 데이터가 없습니다.")
+    result = results[0]
+    currency = result.get("meta", {}).get("currency")
+    if currency not in {"KRW", "USD"}:
         raise RuntimeError(
-            "GOOGLE_SHEETS_CREDENTIALS와 GOOGLE_SHEET_ID 설정이 필요합니다."
+            f"{ticker} 시세 통화가 {currency or '미상'}입니다. "
+            "현재 리포트는 원화(KRW)와 미국 달러(USD) 종목을 지원합니다."
         )
 
-    try:
-        from google.auth.transport.requests import AuthorizedSession
-        from google.auth.exceptions import GoogleAuthError
-        from google.oauth2.service_account import Credentials
-        from requests.exceptions import RequestException
-    except ImportError as exc:
-        raise RuntimeError("Google Sheets 연결을 위해 google-auth 패키지가 필요합니다.") from exc
+    metadata = result.get("meta", {})
+    price = metadata.get("regularMarketPrice")
+    timestamp = metadata.get("regularMarketTime")
+    if price is None or timestamp is None:
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
+        timestamps = result.get("timestamp") or []
+        closes = quote.get("close") or []
+        valid_rows = [
+            (row_timestamp, close)
+            for row_timestamp, close in zip(timestamps, closes)
+            if close is not None
+        ]
+        if not valid_rows:
+            raise RuntimeError(f"{ticker}의 유효한 시세가 없습니다.")
+        timestamp, price = valid_rows[-1]
+    quote_time = datetime.fromtimestamp(timestamp, timezone.utc).astimezone(SEOUL)
+    return Decimal(str(price)), quote_time, currency
 
-    try:
-        service_account_info = json.loads(credentials_json)
-        credentials = Credentials.from_service_account_info(
-            service_account_info, scopes=[SHEETS_SCOPE]
+
+def make_report(holdings, quotes, usd_krw=None):
+    total = Decimal(0)
+    lines = ["📊 보유 주식 일일 평가 리포트"]
+    for holding in holdings:
+        ticker = holding["ticker"]
+        if ticker not in quotes:
+            raise ValueError(f"{ticker}의 시세 데이터가 없습니다.")
+        price, quote_time, currency = quotes[ticker]
+        if currency == "USD":
+            if usd_krw is None:
+                raise ValueError("미국 주식 평가에 필요한 USD/KRW 환율이 없습니다.")
+            market_value = price * holding["quantity"] * usd_krw[0]
+            local_price = f"${price:,.2f}"
+            quote_label = f"{quote_time:%m-%d %H:%M} KST"
+        else:
+            market_value = price * holding["quantity"]
+            local_price = f"₩{price:,.0f}"
+            quote_label = f"{quote_time:%Y-%m-%d %H:%M} KST"
+        total += market_value
+        quantity = f"{holding['quantity']:,.4f}".rstrip("0").rstrip(".")
+        lines.append(
+            f"• {holding['name']} {quantity}주 × {local_price}"
+            f" = ₩{market_value:,.0f} ({quote_label})"
         )
-    except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
-        raise RuntimeError(f"Google 서비스 계정 인증 정보가 올바르지 않습니다: {exc}") from exc
-
-    escaped_sheet_name = sheet_name.replace("'", "''")
-    cell_range = f"'{escaped_sheet_name}'!A:ZZ"
-    endpoint = (
-        "https://sheets.googleapis.com/v4/spreadsheets/"
-        f"{urllib.parse.quote(spreadsheet_id, safe='')}/values/"
-        f"{urllib.parse.quote(cell_range, safe='')}"
+    lines.extend(["", f"총 평가액: ₩{total:,.0f}"])
+    if usd_krw is not None:
+        fx_rate, fx_time = usd_krw
+        lines.append(f"환율: $1 = ₩{fx_rate:,.2f} ({fx_time:%m-%d %H:%M} KST)")
+    lines.append(
+        "가격 기준: 최신 정규장 시세 | Yahoo Finance "
+        "| 수수료·세금·현금은 반영하지 않았습니다."
     )
-    try:
-        response = AuthorizedSession(credentials).get(endpoint, timeout=30)
-    except GoogleAuthError as exc:
-        raise RuntimeError(f"Google Sheets 인증에 실패했습니다: {exc}") from exc
-    except RequestException as exc:
-        raise RuntimeError(f"Google Sheets 요청에 실패했습니다: {exc}") from exc
-    if not response.ok:
-        try:
-            details = response.json().get("error", {}).get("message", "알 수 없는 오류")
-        except ValueError:
-            details = "응답을 해석할 수 없습니다."
-        raise RuntimeError(
-            f"Google Sheets 조회 실패 (HTTP {response.status_code}): {details}"
-        )
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Google Sheets 응답이 올바른 JSON이 아닙니다.") from exc
-    rows = payload.get("values")
-    if not rows:
-        raise RuntimeError(f"'{sheet_name}' 시트에 읽을 데이터가 없습니다.")
-    return rows
+    return "\n".join(lines)
 
 
 def main():
     try:
-        values = get_sheet_values()
-        history = parse_history(
-            values,
-            date_column=os.environ.get("ASSET_DATE_COLUMN"),
-            value_column=os.environ.get("ASSET_VALUE_COLUMN"),
+        raw_holdings = os.environ.get("ASSET_HOLDINGS_JSON")
+        if not raw_holdings:
+            raise RuntimeError(
+                "GitHub Actions Secret ASSET_HOLDINGS_JSON을 설정해야 합니다."
+            )
+        holdings = parse_holdings(raw_holdings)
+        quotes = {
+            holding["ticker"]: get_latest_price(holding["ticker"])
+            for holding in holdings
+        }
+        usd_krw = (
+            get_latest_price("KRW=X")[:2]
+            if any(quote[2] == "USD" for quote in quotes.values())
+            else None
         )
-        message = make_report(history, os.environ.get("ASSET_CURRENCY", "원"))
-        send_telegram(message)
+        send_telegram(make_report(holdings, quotes, usd_krw))
     except (RuntimeError, ValueError) as exc:
         print(f"자산 리포트 실패: {exc}", file=sys.stderr)
         return 1

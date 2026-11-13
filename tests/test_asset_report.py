@@ -1,47 +1,79 @@
 import unittest
-from datetime import date
+from datetime import datetime, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
-from asset_report import make_report, parse_history
+from asset_report import get_latest_price, make_report, parse_holdings
 
 
-class ParseHistoryTests(unittest.TestCase):
-    def test_sums_asset_rows_per_date_and_uses_latest_two_days(self):
-        history = parse_history([
-            ["날짜", "총액(원)"],
-            ["2026-10-16", "1,000,000원"],
-            ["2026-10-16", "500000"],
-            ["2026-10-17", "₩1,600,000"],
-        ])
-
-        self.assertEqual(history, {
-            date(2026, 10, 16): Decimal("1500000"),
-            date(2026, 10, 17): Decimal("1600000"),
-        })
-        report = make_report(history)
-        self.assertIn("총 평가액: 1,600,000 원", report)
-        self.assertIn("2026-10-16 대비 +100,000 원 (+6.67%)", report)
-
-    def test_supports_configured_headers(self):
-        history = parse_history(
-            [["일자", "총액"], ["2026/10/16", "100"], ["2026/10/17", "125"]],
-            date_column="일자",
-            value_column="총액",
+class HoldingsTests(unittest.TestCase):
+    def test_parses_holdings_without_rounding_quantities(self):
+        holdings = parse_holdings(
+            '[{"ticker":"000660.KS","name":"example","quantity":103},'
+            '{"ticker":"035420.KS","name":"another","quantity":2.5}]'
         )
 
-        self.assertEqual(list(history.values()), [Decimal("100"), Decimal("125")])
+        self.assertEqual(holdings[0]["quantity"], Decimal("103"))
+        self.assertEqual(holdings[1]["quantity"], Decimal("2.5"))
 
-    def test_requires_two_distinct_dates(self):
-        with self.assertRaisesRegex(ValueError, "최소 2개"):
-            parse_history([["날짜", "평가액"], ["2026-10-17", "100"]])
+    def test_rejects_duplicate_tickers(self):
+        raw = (
+            '[{"ticker":"000660.KS","name":"one","quantity":1},'
+            '{"ticker":"000660.KS","name":"duplicate","quantity":2}]'
+        )
+        with self.assertRaisesRegex(ValueError, "중복"):
+            parse_holdings(raw)
 
-    def test_reports_invalid_rows_with_row_number(self):
-        with self.assertRaisesRegex(ValueError, "3행 처리 실패"):
-            parse_history([
-                ["날짜", "평가액"],
-                ["2026-10-16", "100"],
-                ["2026-10-17", "잘못된 값"],
-            ])
+    def test_rejects_invalid_or_nonpositive_quantities(self):
+        for quantity in ("0", "-1", "NaN", "not-a-number"):
+            with self.subTest(quantity=quantity):
+                raw = (
+                    '[{"ticker":"000660.KS","name":"example",'
+                    f'"quantity":"{quantity}"' + "}]"
+                )
+                with self.assertRaises(ValueError):
+                    parse_holdings(raw)
+
+    def test_formats_each_position_and_krw_total(self):
+        holdings = parse_holdings(
+            '[{"ticker":"000660.KS","name":"example","quantity":2},'
+            '{"ticker":"035420.KS","name":"another","quantity":3}]'
+        )
+        report = make_report(
+            holdings,
+            {
+                "000660.KS": (
+                    Decimal("1000"),
+                    datetime(2026, 11, 12, 6, 0, tzinfo=timezone.utc),
+                    "KRW",
+                ),
+                "035420.KS": (
+                    Decimal("2"),
+                    datetime(2026, 11, 12, 7, 0, tzinfo=timezone.utc),
+                    "USD",
+                ),
+            },
+            (Decimal("1300"), datetime(2026, 11, 12, 8, 0, tzinfo=timezone.utc)),
+        )
+
+        self.assertIn("총 평가액: ₩9,800", report)
+        self.assertIn("₩2,000", report)
+        self.assertIn("₩7,800", report)
+        self.assertIn("$1 = ₩1,300.00", report)
+
+    @patch("asset_report.fetch")
+    def test_reads_usd_regular_market_quote(self, mock_fetch):
+        mock_fetch.return_value = (
+            b'{"chart":{"result":[{"meta":{"currency":"USD",'
+            b'"regularMarketPrice":123.45,"regularMarketTime":1794493800},'
+            b'"timestamp":[],"indicators":{}}],"error":null}}'
+        )
+
+        price, quote_time, currency = get_latest_price("TSLA")
+
+        self.assertEqual(price, Decimal("123.45"))
+        self.assertEqual(currency, "USD")
+        self.assertEqual(str(quote_time.tzinfo), "Asia/Seoul")
 
 
 if __name__ == "__main__":

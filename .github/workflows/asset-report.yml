@@ -20,12 +20,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Send daily asset report
         env:
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          ASSET_SHEET_NAME: ${{ vars.ASSET_SHEET_NAME || 'Sheet1' }}
-          ASSET_DATE_COLUMN: ${{ vars.ASSET_DATE_COLUMN || '날짜' }}
-          ASSET_VALUE_COLUMN: ${{ vars.ASSET_VALUE_COLUMN || '총액(원)' }}
-          ASSET_CURRENCY: ${{ vars.ASSET_CURRENCY || '원' }}
+          ASSET_HOLDINGS_JSON: ${{ secrets.ASSET_HOLDINGS_JSON }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python asset_report.py
