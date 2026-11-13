@@ -66,6 +66,7 @@ class HoldingsTests(unittest.TestCase):
         self.assertIn("3주", report)
         self.assertIn("20.4%", report)
         self.assertIn("79.6%", report)
+        self.assertEqual(report.splitlines()[-1], "📌 전체 주식금액 합계: ₩9,800")
 
     @patch("asset_report.fetch")
     def test_reads_usd_regular_market_quote(self, mock_fetch):

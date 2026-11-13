@@ -45,6 +45,7 @@ portfolio total. Telegram messages put the total first, then show Korean and
 U.S. holdings in separate groups with group subtotals and each holding's share
 of the portfolio. The USD/KRW rate appears once at the bottom, not alongside
 each U.S. holding. Commissions, taxes, and cash balances are not included.
+The final line repeats the total stock value for quick reference.
 
 ## Market-close schedule
 

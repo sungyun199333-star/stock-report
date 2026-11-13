@@ -149,6 +149,7 @@ def make_report(holdings, quotes, usd_krw=None, session_label=""):
         "",
         "시세: 각 시장의 최신 정규장 기준 · Yahoo Finance",
         "수수료·세금·현금 미포함",
+        f"📌 전체 주식금액 합계: ₩{total:,.0f}",
     ])
     return "\n".join(lines)
 
