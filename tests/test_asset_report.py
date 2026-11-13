@@ -1,5 +1,4 @@
 import unittest
-from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -42,24 +41,24 @@ class HoldingsTests(unittest.TestCase):
         report = make_report(
             holdings,
             {
-                "TEST1.KS": (
-                    Decimal("1000"),
-                    datetime(2026, 11, 12, 6, 0, tzinfo=timezone.utc),
-                    "KRW",
-                ),
-                "TEST2.KQ": (
-                    Decimal("2"),
-                    datetime(2026, 11, 12, 7, 0, tzinfo=timezone.utc),
-                    "USD",
-                ),
+                "TEST1.KS": (Decimal("1000"), "KRW"),
+                "TEST2.KQ": (Decimal("2"), "USD"),
             },
-            (Decimal("1300"), datetime(2026, 11, 12, 8, 0, tzinfo=timezone.utc)),
+            (Decimal("1300"), "KRW"),
         )
 
-        self.assertIn("총 평가액: ₩9,800", report)
+        self.assertIn("💰 총 보유자산\n₩9,800", report)
+        self.assertIn("🇰🇷 한국 주식 · 1종목", report)
+        self.assertIn("🇺🇸 미국 주식 · 1종목", report)
+        self.assertIn("소계  ₩2,000", report)
+        self.assertIn("소계  ₩7,800", report)
         self.assertIn("₩2,000", report)
         self.assertIn("₩7,800", report)
-        self.assertIn("$1 = ₩1,300.00", report)
+        self.assertEqual(report.count("$1 = ₩1,300.00"), 1)
+        self.assertIn("2주", report)
+        self.assertIn("3주", report)
+        self.assertIn("20.4%", report)
+        self.assertIn("79.6%", report)
 
     @patch("asset_report.fetch")
     def test_reads_usd_regular_market_quote(self, mock_fetch):
@@ -69,11 +68,10 @@ class HoldingsTests(unittest.TestCase):
             b'"timestamp":[],"indicators":{}}],"error":null}}'
         )
 
-        price, quote_time, currency = get_latest_price("TSLA")
+        price, currency = get_latest_price("TSLA")
 
         self.assertEqual(price, Decimal("123.45"))
         self.assertEqual(currency, "USD")
-        self.assertEqual(str(quote_time.tzinfo), "Asia/Seoul")
 
 
 if __name__ == "__main__":

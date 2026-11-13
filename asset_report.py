@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -75,55 +75,67 @@ def get_latest_price(ticker):
 
     metadata = result.get("meta", {})
     price = metadata.get("regularMarketPrice")
-    timestamp = metadata.get("regularMarketTime")
-    if price is None or timestamp is None:
+    if price is None:
         quote = result.get("indicators", {}).get("quote", [{}])[0]
-        timestamps = result.get("timestamp") or []
         closes = quote.get("close") or []
-        valid_rows = [
-            (row_timestamp, close)
-            for row_timestamp, close in zip(timestamps, closes)
-            if close is not None
-        ]
-        if not valid_rows:
+        valid_closes = [close for close in closes if close is not None]
+        if not valid_closes:
             raise RuntimeError(f"{ticker}의 유효한 시세가 없습니다.")
-        timestamp, price = valid_rows[-1]
-    quote_time = datetime.fromtimestamp(timestamp, timezone.utc).astimezone(SEOUL)
-    return Decimal(str(price)), quote_time, currency
+        price = valid_closes[-1]
+    return Decimal(str(price)), currency
 
 
 def make_report(holdings, quotes, usd_krw=None):
-    total = Decimal(0)
-    lines = ["📊 보유 주식 일일 평가 리포트"]
+    groups = {"KRW": [], "USD": []}
     for holding in holdings:
         ticker = holding["ticker"]
         if ticker not in quotes:
             raise ValueError(f"{ticker}의 시세 데이터가 없습니다.")
-        price, quote_time, currency = quotes[ticker]
+        price, currency = quotes[ticker]
         if currency == "USD":
             if usd_krw is None:
                 raise ValueError("미국 주식 평가에 필요한 USD/KRW 환율이 없습니다.")
             market_value = price * holding["quantity"] * usd_krw[0]
             local_price = f"${price:,.2f}"
-            quote_label = f"{quote_time:%m-%d %H:%M} KST"
         else:
             market_value = price * holding["quantity"]
             local_price = f"₩{price:,.0f}"
-            quote_label = f"{quote_time:%Y-%m-%d %H:%M} KST"
-        total += market_value
-        quantity = f"{holding['quantity']:,.4f}".rstrip("0").rstrip(".")
-        lines.append(
-            f"• {holding['name']} {quantity}주 × {local_price}"
-            f" = ₩{market_value:,.0f} ({quote_label})"
-        )
-    lines.extend(["", f"총 평가액: ₩{total:,.0f}"])
-    if usd_krw is not None:
-        fx_rate, fx_time = usd_krw
-        lines.append(f"환율: $1 = ₩{fx_rate:,.2f} ({fx_time:%m-%d %H:%M} KST)")
-    lines.append(
-        "가격 기준: 최신 정규장 시세 | Yahoo Finance "
-        "| 수수료·세금·현금은 반영하지 않았습니다."
+        groups[currency].append((holding, price, local_price, market_value))
+
+    total = sum(
+        (row[3] for currency_rows in groups.values() for row in currency_rows),
+        Decimal(0),
     )
+    report_date = datetime.now(SEOUL).strftime("%Y-%m-%d")
+    lines = [
+        f"📊 자산 평가 리포트 · {report_date}",
+        "",
+        "💰 총 보유자산",
+        f"₩{total:,.0f}",
+    ]
+
+    for currency, label in (("KRW", "🇰🇷 한국 주식"), ("USD", "🇺🇸 미국 주식")):
+        rows = groups[currency]
+        if not rows:
+            continue
+        subtotal = sum((row[3] for row in rows), Decimal(0))
+        lines.extend(["", f"{label} · {len(rows)}종목", f"소계  ₩{subtotal:,.0f}"])
+        for holding, _price, local_price, market_value in rows:
+            weight = market_value / total * Decimal(100) if total else Decimal(0)
+            quantity = f"{holding['quantity']:,.4f}".rstrip("0").rstrip(".")
+            lines.extend([
+                f"• {holding['name']} · {quantity}주",
+                f"  {local_price}/주 → ₩{market_value:,.0f} · {weight:.1f}%",
+            ])
+
+    if usd_krw is not None:
+        fx_rate, _fx_currency = usd_krw
+        lines.extend(["", f"💱 미국 주식 환산 환율  $1 = ₩{fx_rate:,.2f}"])
+    lines.extend([
+        "",
+        "시세: 각 시장의 최신 정규장 기준 · Yahoo Finance",
+        "수수료·세금·현금 미포함",
+    ])
     return "\n".join(lines)
 
 
@@ -140,10 +152,12 @@ def main():
             for holding in holdings
         }
         usd_krw = (
-            get_latest_price("KRW=X")[:2]
-            if any(quote[2] == "USD" for quote in quotes.values())
+            get_latest_price("KRW=X")
+            if any(quote[1] == "USD" for quote in quotes.values())
             else None
         )
+        if usd_krw is not None and usd_krw[1] != "KRW":
+            raise RuntimeError("USD/KRW 환율 시세의 통화가 올바르지 않습니다.")
         send_telegram(make_report(holdings, quotes, usd_krw))
     except (RuntimeError, ValueError) as exc:
         print(f"자산 리포트 실패: {exc}", file=sys.stderr)

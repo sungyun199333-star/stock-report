@@ -41,7 +41,10 @@ The report uses the latest available regular-session quote from Yahoo Finance.
 KRW quotes are included directly; USD quotes are converted using Yahoo
 Finance's USD/KRW rate. On weekends and market holidays, the latest available
 quotes will be reported. The report shows each holding's KRW value and the
-portfolio total; commissions, taxes, and cash balances are not included.
+portfolio total. Telegram messages put the total first, then show Korean and
+U.S. holdings in separate groups with group subtotals and each holding's share
+of the portfolio. The USD/KRW rate appears once at the bottom, not alongside
+each U.S. holding. Commissions, taxes, and cash balances are not included.
 
 The schedule is `0 21 * * *` in UTC, or 06:00 the following day in Korea
 Standard Time. GitHub Actions may delay scheduled starts. Scheduled workflows
